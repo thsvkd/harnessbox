@@ -109,6 +109,7 @@ export interface ProxyOptions {
 export function startProxy(sockPath: string, options: ProxyOptions): Promise<Server>;
 export function scrubHome(home: string, keep?: readonly string[], jsonKeys?: Record<string, readonly string[]>): Promise<void>;
 export function readOut(realDir: string, name: string, max?: number): Promise<string | null>;
+export function readOutBytes(realDir: string, name: string, max?: number): Promise<Buffer | null>;
 export function parseStat(text: string): { pid: number; ppid: number };
 export function countDescendants(rootPids: readonly number[], procDir?: string): Promise<Map<number, number>>;
 export function diskUse(roots: readonly string[], cap?: number): Promise<{ bytes: number; entries: number }>;

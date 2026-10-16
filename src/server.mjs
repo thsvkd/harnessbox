@@ -9,7 +9,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } fro
 import http from 'node:http';
 import { dirname, join } from 'node:path';
 import { claudeCode, codex, grok } from './adapters.mjs';
-import { ID, readOut } from './box.mjs';
+import { ID, readOutBytes } from './box.mjs';
 import { Busy, createRunner } from './runner.mjs';
 
 /** Where every run's folder appears inside its box: prompts, files and tool rules can name /work/... before the run exists. */
@@ -89,8 +89,9 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   const view = (x) => ({ state: x.s.state === 'refused' ? 'starting' : x.s.state, url: x.s.url, code: x.s.code, needsCode: x.s.needsCode, startedAt: x.startedAt, expiresAt: x.expiresAt,
     ...(x.s.error ? { error: x.s.error } : {}), ...(x.status ? { status: x.status } : {}) });
   async function startLogin(c, scoped, h) {
-    if ([...sessions.entries()].filter(([k, x]) => k.startsWith(`${c.id}/`) && ['starting', 'waiting'].includes(x.s.state)).length >= L.logins) no(429, 'too_many_logins', `at most ${L.logins} logins waiting per client`);
-    const k = `${scoped}/${h}`, s = hb.login(scoped, h), now = Date.now();
+    const k = `${scoped}/${h}`;
+    if ([...sessions.entries()].filter(([key, x]) => key !== k && key.startsWith(`${c.id}/`) && ['starting', 'waiting'].includes(x.s.state)).length >= L.logins) no(429, 'too_many_logins', `at most ${L.logins} logins waiting per client`);
+    const s = hb.login(scoped, h), now = Date.now();
     const x = { s, startedAt: new Date(now).toISOString(), expiresAt: new Date(now + 10 * 60e3).toISOString(), status: null };
     sessions.set(k, x);
     statuses.delete(k);
@@ -129,7 +130,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       validate = { argv, ms };
     }
     const files = b.files ?? [];
-    if (!Array.isArray(files) || files.length > L.files) no(400, 'bad_files', `files: at most ${L.files}`);
+    if (!Array.isArray(files) || files.length > L.files || files.reduce((n, f) => n + 1 + (Array.isArray(f?.copies) ? f.copies.length : 0), 0) > L.files) no(400, 'bad_files', `files: at most ${L.files}, including copies`);
     const mine = [...runs.values()].filter((r) => r.client === c.id);
     if (mine.filter((r) => ACTIVE.has(r.state)).length >= L.activeRuns) no(429, 'too_many_runs', `at most ${L.activeRuns} active runs per client`);
     if (mine.length >= L.keptRuns) {
@@ -139,8 +140,17 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     }
 
     // the folder: work/ is the box's /work; readonly folders are written beside it (ro/) and bound read-only over work/<folder>
-    const id = `run_${randomBytes(12).toString('base64url')}`, root = await mkdtemp(join(runsDir, `${id}-`)), work = join(root, 'work');
+    const id = `run_${randomBytes(12).toString('base64url')}`;
+    const r = {
+      id, client: c.id, user: b.user, scoped, harness: h, model: b.model ?? null, state: 'queued', createdAt: new Date().toISOString(), startedAt: null, endedAt: null,
+      stage: '', events: 0, result: null, validator: null, outputs: null, error: null, ac: new AbortController(), listeners: new Set(),
+    };
+    // Reserve admission before the first filesystem await, including concurrent uploads still being staged.
+    runs.set(id, r);
+    let root, work;
     try {
+      root = await mkdtemp(join(runsDir, `${id}-`));
+      work = join(root, 'work');
       await mkdir(work);
       let bytes = 0;
       for (const f of files) {
@@ -158,12 +168,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       }
       for (const p of [...readonly, ...outputs.map(dirname).filter((d) => d !== '.')]) await mkdir(join(work, p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));
       for (const p of readonly) await mkdir(join(root, 'ro', p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));
-    } catch (e) { await rm(root, { recursive: true, force: true }); throw e; }
-    const r = {
-      id, client: c.id, user: b.user, scoped, harness: h, model: b.model ?? null, state: 'queued', createdAt: new Date().toISOString(), startedAt: null, endedAt: null,
-      stage: '', events: 0, result: null, validator: null, outputs: null, error: null, ac: new AbortController(), listeners: new Set(),
-    };
-    runs.set(id, r);
+    } catch (e) { runs.delete(id); if (root) await rm(root, { recursive: true, force: true }); throw e; }
     log(`run client=${c.id} run=${id} user=${scoped} harness=${h} queued`);
     void execute(r, { root, work, prompt: b.prompt, timeoutMs, args, outputs, validate, roBinds: readonly.map((p) => [join(root, 'ro', p), join(BOX_DIR, p)]) });
     return r;
@@ -195,8 +200,8 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       let total = 0;
       r.outputs = {};
       for (const p of outputs) {
-        const text = await readOut(real, p, L.output);
-        if (text !== null && (total += Buffer.byteLength(text)) <= L.outputsBytes) r.outputs[p] = Buffer.from(text).toString('base64');
+        const bytes = await readOutBytes(real, p, L.output);
+        if (bytes !== null && (total += bytes.length) <= L.outputsBytes) r.outputs[p] = bytes.toString('base64');
         else r.outputs[p] = null;
       }
       r.bytes = total + Buffer.byteLength(res.text) + Buffer.byteLength(res.stderr) + Buffer.byteLength(r.validator?.out ?? '');

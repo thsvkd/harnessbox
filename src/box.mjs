@@ -107,6 +107,11 @@ async function keepKeys(file, size, keys) {
  * otherwise every read is null.
  */
 export async function readOut(realDir, name, max = 2 * 1024 * 1024) {
+  return (await readOutBytes(realDir, name, max))?.toString('utf8') ?? null;
+}
+
+/** The same bounded, no-symlink read as readOut(), preserving arbitrary file bytes. */
+export async function readOutBytes(realDir, name, max = 2 * 1024 * 1024) {
   if (isAbsolute(name) || name.split('/').includes('..')) return null;
   const want = join(realDir, name);
   let fh;
@@ -114,7 +119,7 @@ export async function readOut(realDir, name, max = 2 * 1024 * 1024) {
     fh = await open(want, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     if (!(await fh.stat()).isFile() || (await readlink(`/proc/self/fd/${fh.fd}`)) !== want) return null;
     const buf = Buffer.alloc(max + 1), { bytesRead } = await fh.read(buf, 0, max + 1, 0);
-    return bytesRead > max ? null : buf.subarray(0, bytesRead).toString('utf8');
+    return bytesRead > max ? null : buf.subarray(0, bytesRead);
   } catch { return null; } finally { await fh?.close(); }
 }
 

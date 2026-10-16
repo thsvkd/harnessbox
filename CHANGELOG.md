@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - The service: `node src/server.mjs` (the image's default command) serves an HTTP API on a unix socket (or a private TCP port)
   to client apps, each with its own bearer token and users under `/homes/<client>/<user>/<harness>`: harness status, logins
@@ -12,6 +12,10 @@
   listener (which ended the calling app's process).
 - The service reads `HB_MAX_OUTPUT_BYTES` (a run's stdout + stderr, default 8 MiB) and refuses to start on a bad value.
 - Deploy: `deploy/service-smoke.mjs`, `deploy/move-homes.sh`; compose shows the service with a client app sharing the socket.
+- Give the service test preflight the x64 loader alias so its real sandbox tests run on both supported architectures.
+- Reserve run admission before staging concurrent uploads; include file copies in the file-count cap and allow replacing a login at its waiting-login cap.
+- Preserve binary output bytes through the service; add `readOutBytes()` alongside the existing text reader.
+- Skip symlinked credential directories when migrating homes.
 
 ## 0.1.1
 

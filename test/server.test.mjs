@@ -15,7 +15,7 @@ import { BOX_DIR, createService } from '../src/server.mjs';
 
 const HERE = import.meta.dirname;
 const FAKE = { 'claude-code': join(HERE, 'fake-claude'), codex: join(HERE, 'fake-codex'), grok: join(HERE, 'fake-grok') };
-const canBox = spawnSync('bwrap', ['--unshare-all', '--die-with-parent', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--proc', '/proc', '--dev', '/dev', '/usr/bin/true']).status === 0;
+const canBox = spawnSync('bwrap', ['--unshare-all', '--die-with-parent', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc', '--dev', '/dev', '/usr/bin/true']).status === 0;
 const BOX = { skip: !canBox && 'needs bubblewrap with user namespaces' };
 const TOKEN = { a: 'token-of-client-a-0123456789', b: 'token-of-client-b-0123456789' };
 const hex = (t) => createHash('sha256').update(t).digest('hex');
@@ -243,4 +243,47 @@ test('client: an event that is not JSON rejects that subscription with bad_event
     fake.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('service: simultaneous uploads reserve the active-run limit before staging files', BOX, async () => {
+  const w = await world({ limits: { activeRuns: 1 } });
+  try {
+    w.logIn('appa', 'u1', 'claude-code');
+    await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: '../bad', text: 'x' }] }), { status: 400 });
+    const files = Array.from({ length: 64 }, (_, i) => ({ path: `f${i}.txt`, text: 'upload' }));
+    const results = await Promise.allSettled(Array.from({ length: 8 }, () => w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'FAKE_MODE=hang', files })));
+    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+    const rejected = results.filter((r) => r.status === 'rejected');
+    assert.equal(rejected.length, 7);
+    assert.ok(rejected.every((r) => r.reason.status === 429 && r.reason.code === 'too_many_runs'));
+  } finally { await w.close(); }
+});
+
+test('service: binary outputs round-trip without UTF-8 conversion', BOX, async () => {
+  const w = await world();
+  try {
+    w.logIn('appa', 'u1', 'claude-code');
+    const bytes = Buffer.from([0xff, 0xd8, 0x00, 0x80, 0xfe]);
+    const r = await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: 'photo.jpg', base64: bytes.toString('base64') }], outputs: ['photo.jpg'] })).id);
+    assert.equal(r.state, 'done');
+    assert.deepEqual(Buffer.from(r.outputs['photo.jpg'], 'base64'), bytes);
+  } finally { await w.close(); }
+});
+
+test('service: a login can replace itself when the waiting-login limit is full', BOX, async () => {
+  const w = await world({ limits: { logins: 1 } });
+  try {
+    assert.equal((await w.a.login('u1', 'claude-code')).state, 'waiting');
+    assert.equal((await w.a.login('u1', 'claude-code')).state, 'waiting');
+    await assert.rejects(w.a.login('u2', 'claude-code'), { status: 429, code: 'too_many_logins' });
+    await w.a.cancelLogin('u1', 'claude-code');
+  } finally { await w.close(); }
+});
+
+test('service: file copies count against the file-count limit', BOX, async () => {
+  const w = await world({ limits: { files: 1 } });
+  try {
+    await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: 'a', text: 'x', copies: ['b'] }] }), { status: 400, code: 'bad_files' });
+    assert.deepEqual(readdirSync(w.runs), []);
+  } finally { await w.close(); }
 });

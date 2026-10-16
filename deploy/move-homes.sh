@@ -8,7 +8,7 @@ set -eu
 umask 077
 old=$1 new=$2 client=$3
 copy() { # <from> <to>: a regular file that is not a link
-  if [ -f "$1" ] && [ ! -L "$1" ]; then mkdir -p -m 700 "$(dirname "$2")"; cp "$1" "$2"; chmod 600 "$2"; echo "  $2"; fi
+  if [ -f "$1" ] && [ ! -L "$1" ] && [ ! -L "$(dirname "$1")" ]; then mkdir -p -m 700 "$(dirname "$2")"; cp "$1" "$2"; chmod 600 "$2"; echo "  $2"; fi
 }
 for d in "$old"/*/; do
   d=${d%/}; u=${d##*/}
