@@ -191,7 +191,7 @@ export function seccompFilter(arch = process.arch) {
 }
 
 /**
- * bubblewrap argv for one box. Only <home> and <dir> are writable; /usr and /etc read-only; fresh /proc, /dev and 256 MB /tmp and
+ * bubblewrap argv for one box. Only <home> and <dir> (seen at boxDir inside, by default the same path) are writable; /usr and /etc read-only; fresh /proc, /dev and 256 MB /tmp and
  * /run; no network but, with net 'proxy', loopback :3128 that socat bridges to the per-box proxy socket. env: variables on top of
  * HOME, PATH, USER, LANG and SHELL (nothing of the runner's environment gets in). roBinds: paths (or [src, dest]) bound read-only
  * after the home and the folder (CLI folders outside /usr, a pristine copy of something the box must not change). maxTasks:
@@ -199,12 +199,12 @@ export function seccompFilter(arch = process.arch) {
  * nested: the box may create user namespaces (a CLI's own sandbox may need them); otherwise --disable-userns keeps the kernel's userns
  * surface away from the model's commands. seccomp: the filter (seccompFilter) is read from fd 3.
  */
-export function boxArgs({ home, dir, net, sock, socat, path, env = {}, roBinds = [], chdir, cmd, maxTasks = 512, nested = false, seccomp = false }) {
+export function boxArgs({ home, dir, boxDir = dir, net, sock, socat, path, env = {}, roBinds = [], chdir, cmd, maxTasks = 512, nested = false, seccomp = false }) {
   const a = ['--die-with-parent', '--new-session', '--unshare-all', ...(nested ? [] : ['--unshare-user', '--disable-userns']), '--cap-drop', 'ALL', '--clearenv',
     '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/sbin', '/sbin', '--symlink', 'usr/lib', '/lib',
     '--symlink', 'usr/lib64', '/lib64', '--ro-bind', '/etc', '/etc', // x64 ELF binaries need /lib64/ld-linux-x86-64.so.2
     '--proc', '/proc', '--dev', '/dev', '--size', String(BOX_TMP_BYTES), '--tmpfs', '/tmp', '--size', String(BOX_TMP_BYTES), '--tmpfs', '/run',
-    '--bind', home, home, ...(dir ? ['--bind', dir, dir] : [])];
+    '--bind', home, home, ...(dir ? ['--bind', dir, boxDir] : [])];
   for (const b of roBinds) a.push('--ro-bind', ...(Array.isArray(b) ? b : [b, b]));
   if (chdir) a.push('--chdir', chdir);
   if (seccomp) a.push('--seccomp', '3');

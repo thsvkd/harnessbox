@@ -13,6 +13,7 @@ import { boxArgs, countDescendants, diskUse, ID, readOut, scrubHome, seccompFilt
 
 const LOGIN_MS = 10 * 60e3, PROBE_MS = 30e3;
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g, CODE = /^[\x21-\x7e]{1,2048}$/;
+const USER = new RegExp(`^${ID.source.slice(1, -1)}(/${ID.source.slice(1, -1)})?$`), MODEL = /^[A-Za-z0-9._:@/-]{1,100}$/;
 
 /** A status or logout that could not get the user's lock (or a quick-box slot) in time: ask again later. */
 export class Busy extends Error {}
@@ -117,7 +118,8 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   const homeOf = (userId, a) => join(homes, userId, a.id);
   const cli = (a, args) => [BIN[a.id], ...(a.globalArgs ?? []), ...args];
   const harness = (id) => { const a = byId.get(id); if (!a) throw new Error(`unknown harness ${id}`); return a; };
-  const user = (userId) => { if (!ID.test(userId ?? '')) throw new Error('bad user id'); return userId; };
+  // a user id is `user` or `scope/user` (a service keeps each client's users under its own folder): one or two ids
+  const user = (userId) => { if (!USER.test(userId ?? '')) throw new Error('bad user id'); return userId; };
   let detected = new Map(); // id -> detect() row
   const usable = (id) => { const a = harness(id); if (!detected.get(id)?.usable) throw new Error(`${a.name} is not usable on this runner`); return a; };
 
@@ -125,7 +127,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   const boxes = new Map(); // bwrap pid -> box, for the watchdog and close()
   /** One box over one home, scrubbed to the harness's credentials (and seeded) first; with net 'proxy' a proxy of its own for the
    *  harness's hosts. Resolves to { child, closed (exit code), kill, why (set when the watchdog stopped it) }. */
-  async function spawnBox(a, { home, net = 'none', dir, cmd, stdin = 'ignore', env = {}, label, roBinds = [], nested = false, signal = stop.signal }) {
+  async function spawnBox(a, { home, net = 'none', dir, boxDir = dir, cmd, stdin = 'ignore', env = {}, label, roBinds = [], nested = false, signal = stop.signal }) {
     signal.throwIfAborted();
     await mkdir(home, { recursive: true, mode: 0o700 });
     await scrubHome(home, a.keep, a.keepJsonKeys);
@@ -139,7 +141,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
       proxy = await startProxy(sock, { allow: a.hosts, label, log: report });
     }
     // the kernel's per-box cap counts threads too (a CLI has a few dozen): the watchdog counts processes against maxProcs
-    const args = boxArgs({ home, dir, net, sock, socat: SOCAT, path: PATH_IN_BOX, env: { ...passEnv, ...a.env, ...env }, roBinds: [...RO, ...roBinds], chdir: dir ?? home,
+    const args = boxArgs({ home, dir, boxDir, net, sock, socat: SOCAT, path: PATH_IN_BOX, env: { ...passEnv, ...a.env, ...env }, roBinds: [...RO, ...roBinds], chdir: boxDir ?? home,
       cmd, maxTasks: maxProcs * 4, nested, seccomp: !!filter });
     let child;
     try {
@@ -361,9 +363,11 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
    * One non-interactive run in the user's box: the harness's hardened command (adapter.job) plus args, in dir (writable, the cwd;
    * TMPDIR is dir/.tmp). Waits for a job slot and the user's lock. Never rejects for the CLI's own failure: { code, text, usage
    * ({input, output[, unknown]}), error, stderr (tail), why (watchdog), timedOut, canceled, loggedIn (after a failure: false when the
-   * login is gone, else the CLI's status) }. roBinds: read-only paths in the box (e.g. a pristine skill over dir/skill).
+   * login is gone, else the CLI's status) }. roBinds: read-only paths in the box (e.g. a pristine skill over dir/skill). boxDir: where
+   * the box sees dir (default: the same path). model: the CLI's --model. onStart(): the box started (it waited for the lock and a
+   * slot until then). onEvent(e, { stage }): each JSON event.
    */
-  async function run(userId, id, { prompt, dir, timeoutMs = 40 * 60e3, args = [], env = {}, roBinds = [], signal, onEvent } = {}) {
+  async function run(userId, id, { prompt, dir, boxDir, model, timeoutMs = 40 * 60e3, args = [], env = {}, roBinds = [], signal, onStart, onEvent } = {}) {
     const a = usable(id), k = key(user(userId), a);
     if (typeof prompt !== 'string' || !prompt || prompt.startsWith('-') || prompt.includes('\0')) throw new Error('prompt must be a non-empty string not starting with "-"');
     const canceledResult = () => ({ code: -1, text: '', usage: { input: 0, output: 0, unknown: true }, error: '', stderr: '', why: stop.signal.aborted ? 'runner closed' : null, timedOut: false, canceled: true });
@@ -371,17 +375,19 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
     let release, free;
     try {
       activeSignal.throwIfAborted();
+      if (model != null && !MODEL.test(model)) throw new Error('bad model');
       dir = await realpath(dir); // the adapter's paths and readOut compare against the real path
+      boxDir ??= dir;
       // One user's queued jobs wait on their own lock, not in slots other users need. Both waits are cancelable.
       release = await lock(k, Infinity, activeSignal);
       free = await jobSlots.acquire(activeSignal);
       activeSignal.throwIfAborted();
-      const tmp = join(dir, '.tmp');
-      await mkdir(tmp, { recursive: true });
-      const c = a.job.command({ prompt, dir, has: detected.get(id).has, extra: args });
-      const b = await spawnBox(a, { home: homeOf(userId, a), net: 'proxy', dir, cmd: cli(a, c.args), stdin: c.stdin == null ? 'ignore' : 'pipe',
+      await mkdir(join(dir, '.tmp'), { recursive: true });
+      const tmp = join(boxDir, '.tmp'), c = a.job.command({ prompt, dir: boxDir, has: detected.get(id).has, extra: [...(model ? ['--model', model] : []), ...args] });
+      const b = await spawnBox(a, { home: homeOf(userId, a), net: 'proxy', dir, boxDir, cmd: cli(a, c.args), stdin: c.stdin == null ? 'ignore' : 'pipe',
         env: { TMPDIR: tmp, TMP: tmp, TEMP: tmp, ...env }, label: `job=${userId}`, roBinds, nested: !!a.nested, signal: activeSignal });
       if (c.stdin != null) b.child.stdin.end(c.stdin);
+      try { onStart?.(); } catch { /* the caller's */ }
       const acc = { text: '', usage: { input: 0, output: 0 }, reports: 0, error: '', stage: '' };
       let out = '', err = '', timedOut = false, canceled = false, outputBytes = 0, outputStopped = false;
       const stdout = new StringDecoder('utf8'), stderr = new StringDecoder('utf8');
@@ -400,7 +406,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
         try { e = JSON.parse(l); } catch { return; }
         if (!e || typeof e !== 'object') return;
         try { a.job.event(e, acc); } catch { /* hostile events cannot end the runner */ }
-        try { Promise.resolve(onEvent?.(e)).catch(() => report('onEvent handler failed')); } catch { report('onEvent handler failed'); }
+        try { Promise.resolve(onEvent?.(e, { stage: acc.stage })).catch(() => report('onEvent handler failed')); } catch { report('onEvent handler failed'); }
       };
       b.child.stdout.on('data', (d) => { if (budget(d)) { const lines = (out + stdout.write(d)).split('\n'); out = lines.pop(); lines.forEach(line); } });
       b.child.stderr.on('data', (d) => { if (budget(d)) err = (err + stderr.write(d)).slice(-4000); });
@@ -436,11 +442,13 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   }
 
   /** Any command in the user's box for a harness (a validator over a job's output, say), under the user's lock: { code, out, why }.
-   *  net 'none' by default; 'proxy' gives the harness's hosts. */
-  async function exec(userId, id, argv, { net = 'none', dir, ms = 60e3, stdin, env, roBinds, nested = false } = {}) {
-    const a = harness(id), k = key(user(userId), a);
-    const release = await lock(k, Infinity, stop.signal);
-    try { return await short(a, argv, { home: homeOf(userId, a), net, dir: dir && await realpath(dir), ms, stdin, env, roBinds, nested, label: `exec=${userId}` }); } finally { release(); }
+   *  net 'none' by default; 'proxy' gives the harness's hosts. boxDir: where the box sees dir. */
+  async function exec(userId, id, argv, { net = 'none', dir, boxDir, ms = 60e3, stdin, env, roBinds, nested = false, signal } = {}) {
+    const a = harness(id), k = key(user(userId), a), active = signal ? AbortSignal.any([stop.signal, signal]) : stop.signal;
+    const release = await lock(k, Infinity, active);
+    try {
+      return await short(a, argv, { home: homeOf(userId, a), net, dir: dir && await realpath(dir), boxDir, ms, stdin, env, roBinds, nested, signal: active, label: `exec=${userId}` });
+    } finally { release(); }
   }
 
   /** Stop accepting work, cancel waiters, kill boxes, and wait for in-flight operations to finish their cleanup. Idempotent. */
