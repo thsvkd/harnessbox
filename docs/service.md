@@ -18,7 +18,7 @@ with the same user ids. `src/client.mjs` is a dependency-free client to copy int
 | `HB_MODELS_<ID>` | any | Comma list of allowed `model` values for that harness. |
 | `HB_MAX_JOBS` | 3 | CLI runs at once, all clients together. More wait (queued). |
 | `HB_MAX_QUICK` | 4 | Status and logout boxes at once. |
-| `HB_MAX_BODY` | 64 MiB | Request body cap. |
+| `HB_MAX_BODY` | 64 MiB | Request body cap; the decoded files of a run may take three quarters of it. Size the container's `/tmp` tmpfs for `HB_MAX_JOBS` runs of that. |
 | `HB_BWRAP`, `HB_SOCAT` | on PATH | |
 
 Fixed limits (`LIMITS` in `src/server.mjs`): prompt 256 KiB; 2000 files, 48 MiB decoded; 32 outputs, 2 MiB each, 16 MiB together;
@@ -68,7 +68,8 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
 ```
 
 - The run's folder is `/work` inside the box (and the CLI's working directory), so the prompt, the files and the tool rules can
-  name `/work/...` in advance. Paths are relative, plain segments; a path given twice is refused.
+  name `/work/...` in advance. Paths are relative, plain segments; a path given twice is refused. A file may add `copies: [paths]`
+  (up to 8) to be written there too, without sending the bytes again (they count against the files cap each time).
 - `readonly`: folders whose files are bound read-only over `/work/<folder>` for the CLI and the validator: the model can read a
   skill and run its validator but not change them.
 - `outputs`: files read back after the run: regular files only, never through a link, at most 2 MiB each; `null` when missing, a
@@ -101,6 +102,43 @@ arrive: `stage`, `events`), and `end` (the full run, outputs included), then the
 `DELETE /v1/runs/:id` cancels (204): a running CLI is killed; a queued run leaves the user's lock and the slot queue at once and
 ends without a box. Runs are kept 30 minutes after they end. **A restart forgets every run**: an unknown id is 404,
 and the client starts the run again.
+
+## Example: review-automation's draft job
+
+What its pool runner (`app/runner/rva-runner.mjs`, `runJob`) prepared and checked, as one `POST /v1/runs`:
+
+```js
+const W = '/work', validator = ['python3', '-I', `${W}/skill/write-review/scripts/validate_draft.py`, `${W}/out/draft.json`];
+await hb.run({
+  user: job.userId, harness: job.engine, // 'claude-code' | 'codex'
+  prompt: PROMPT, // unchanged: it names skill/…, request.md, materials/, out/ relative to the working folder
+  files: [
+    ...skillFiles.map((f) => ({ path: `skill/write-review/${f.rel}`, base64: f.bytes.toString('base64') })), // the pristine skill
+    { path: 'request.md', text: requestMd(job, W, stopAt) },  // its validator line now says /work/...
+    { path: 'materials/campaign.md', text: campaignMd(job) }, { path: 'materials/memo.txt', text: `${job.memo}\n` },
+    // body photos also in out/photos/ (the contract's copies; Claude Code cannot copy a binary), reference photos once
+    ...photos.map((p) => ({ path: `materials/photos/${p.name}`, base64: p.b64, ...(p.reference ? {} : { copies: [`out/photos/${p.name}`] }) })),
+    ...docs.map((d) => ({ path: `materials/${d.name}`, base64: d.b64 })),
+  ],
+  readonly: ['skill'],
+  outputs: ['out/draft.json', 'out/draft.md', 'out/handoff.md'],
+  validate: { argv: validator, net: 'none', timeoutMs: 60e3 },
+  timeoutMs: Date.parse(job.deadline) - Date.now() - 3 * 60e3, // its STOP_BEFORE_MS
+  args: job.engine === 'claude-code'
+    ? ['--tools', 'Read,Write,Edit,Agent,Bash', '--allowedTools', `Read(/${W}/**)`, `Edit(/${W}/out/**)`, 'Agent', `Bash(${validator.slice(0, 3).join(' ')} *)`, '--max-turns', '80']
+    : [], // Codex: the adapter's flags are the runner's (--ignore-rules when the CLI has it)
+});
+```
+
+Then, from the ended run: `outputs['out/draft.json']` (base64; `null` means not written) is the draft, `validator.out` is the
+validator's JSON (`{ errors }`), `result.text` is the CLI's last message (Codex's from its `-o` file), `result.usage` the tokens
+(`unknown` when none), `result.loggedIn === false` means the user must log in again, `result.timedOut` is the runner's "stopped
+at the deadline" case (outputs and validator are still there), and a missing `out/draft.md` or `out/handoff.md` is `null`. The
+job's lease and progress map onto the run: `GET /v1/runs/:id` or the event stream while it runs, `DELETE /v1/runs/:id` when the
+user cancels, and a 404 after a service restart means queue it again.
+
+Its existing homes (`/homes/<userId>/.claude/.credentials.json`, `.claude.json`, `.codex/auth.json`) move once with
+`deploy/move-homes.sh` (credential files only, never through a link) to `/homes/<client>/<userId>/<engine>/`.
 
 ## Client module
 

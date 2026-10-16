@@ -44,6 +44,7 @@ const strings = (v, max, what) => {
  */
 export function createService({ hb, harnesses, clients, runs: runsDir, models = {}, limits = {}, log = () => {} }) {
   const L = { ...LIMITS, ...limits };
+  if (limits.body && !limits.filesBytes) L.filesBytes = Math.floor(limits.body * 0.75); // base64 in JSON
   const known = new Map(harnesses.map((h) => [h.id, h]));
   const keys = clients.map((c) => {
     if (!ID.test(c.id ?? '') || !/^[0-9a-f]{64}$/.test(c.tokenSha256 ?? '')) throw new Error(`bad client entry ${c.id}`);
@@ -143,12 +144,17 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       await mkdir(work);
       let bytes = 0;
       for (const f of files) {
-        if (!f || !safePath(f.path) || (typeof f.base64 !== 'string') === (typeof f.text !== 'string')) no(400, 'bad_files', 'each file is { path, base64 } or { path, text }');
+        const copies = f?.copies ?? [];
+        if (!f || !safePath(f.path) || (typeof f.base64 !== 'string') === (typeof f.text !== 'string') || !Array.isArray(copies) || copies.length > 8 || !copies.every(safePath)) {
+          no(400, 'bad_files', 'each file is { path, base64 } or { path, text }, with copies: [paths] at most 8');
+        }
         const data = typeof f.text === 'string' ? Buffer.from(f.text) : Buffer.from(f.base64, 'base64');
-        if ((bytes += data.length) > L.filesBytes) no(413, 'too_large', `files: at most ${L.filesBytes} bytes`);
-        const ro = readonly.find((p) => f.path.startsWith(`${p}/`)), to = ro ? join(root, 'ro', f.path) : join(work, f.path);
-        await mkdir(dirname(to), { recursive: true }).then(() => writeFile(to, data, { flag: 'wx' }))
-          .catch((e) => no(400, 'bad_files', `file ${f.path} clashes with another file or folder (${e.code})`));
+        for (const path of [f.path, ...copies]) {
+          if ((bytes += data.length) > L.filesBytes) no(413, 'too_large', `files: at most ${L.filesBytes} bytes`);
+          const ro = readonly.find((p) => path.startsWith(`${p}/`)), to = ro ? join(root, 'ro', path) : join(work, path);
+          await mkdir(dirname(to), { recursive: true }).then(() => writeFile(to, data, { flag: 'wx' }))
+            .catch((e) => no(400, 'bad_files', `file ${path} clashes with another file or folder (${e.code})`));
+        }
       }
       for (const p of [...readonly, ...outputs.map(dirname).filter((d) => d !== '.')]) await mkdir(join(work, p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));
       for (const p of readonly) await mkdir(join(root, 'ro', p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));

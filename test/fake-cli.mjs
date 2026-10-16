@@ -161,6 +161,7 @@ export async function main(kind) {
   if (mode === 'rva') {
     // review-automation's draft job: out/ files, an attempt on the read-only validator, a link to the credential, an oversized file
     const out = join(dir, 'out');
+    saw.outFiles = readdirSync(out, { recursive: true }).sort();
     writeFileSync(join(out, 'draft.json'), JSON.stringify({ schema_version: 1, title: `draft by ${kind}`, files: readdirSync(join(dir, 'materials'), { recursive: true }).sort() }));
     writeFileSync(join(out, 'draft.md'), '# draft\n');
     writeFileSync(join(out, 'handoff.md'), '# handoff\n');

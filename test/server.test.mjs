@@ -86,7 +86,7 @@ test('service: auth, harness lists per client, logins through the API, status an
 
 const draftJob = (user, harness, more = {}) => ({
   user, harness, prompt: `Read ${BOX_DIR}/request.md. FAKE_MODE=rva`, model: undefined,
-  files: [{ path: 'request.md', text: '# request\n' }, { path: 'materials/photos/p1.jpg', base64: b64('\xff\xd8 not really a jpeg') }, { path: 'materials/memo.txt', text: '메모' },
+  files: [{ path: 'request.md', text: '# request\n' }, { path: 'materials/photos/p1.jpg', base64: b64('\xff\xd8 not really a jpeg'), copies: ['out/photos/p1.jpg'] }, { path: 'materials/memo.txt', text: '메모' },
     { path: 'skill/validate.sh', text: 'f=$1; [ -f "$f" ] && s=$(wc -c < "$f") || s=-1\nn=$( (exec 3<>/dev/tcp/1.1.1.1/443) 2>/dev/null && echo yes || echo no)\necho "{\\"size\\":$s,\\"net\\":\\"$n\\",\\"pwd\\":\\"$PWD\\"}"\n' }],
   readonly: ['skill'],
   outputs: ['out/draft.json', 'out/draft.md', 'out/handoff.md', 'out/missing.json', 'out/evil.json', 'out/big.txt', 'seen.json'],
@@ -110,6 +110,7 @@ test('service: a review-automation-shaped draft job per harness: files in, read-
       assert.ok(r.events > 0 && r.stage);
       const draft = JSON.parse(unb64(r.outputs['out/draft.json']));
       assert.deepEqual(draft.files, ['memo.txt', 'photos', 'photos/p1.jpg']);
+      assert.deepEqual(JSON.parse(unb64(r.outputs['seen.json'])).outFiles, ['photos', 'photos/p1.jpg'], 'the copy is in out/ before the CLI starts');
       assert.equal(unb64(r.outputs['out/draft.md']), '# draft\n');
       assert.deepEqual([r.outputs['out/missing.json'], r.outputs['out/evil.json'], r.outputs['out/big.txt']], [null, null, null], 'missing, a link, over the size cap');
       assert.deepEqual(JSON.parse(r.validator.out), { size: Buffer.byteLength(unb64(r.outputs['out/draft.json'])), net: 'no', pwd: BOX_DIR });
