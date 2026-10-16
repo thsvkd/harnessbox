@@ -122,13 +122,31 @@ export const codex = {
   },
 };
 
-// $GROK_HOME/config.toml (GROK_HOME is unset: ~/.grok), written before each box: no reading of Claude Code, Cursor or Codex skills,
-// rules, agents, MCP servers or hooks from the home or the job folder, no update check, no telemetry, no memory.
+// $GROK_HOME/config.toml (GROK_HOME is unset: ~/.grok), written before each box (docs/user-guide/05-configuration.md and
+// 26-config-reference.md of 1.0.52): no reading of Claude Code or Cursor skills, rules, agents, MCP servers or hooks from the home or
+// the job folder, no update check, no telemetry or trace upload, no memory. Project config in the job folder needs folder trust,
+// which headless runs only get with --trust (never passed).
+const off = (keys) => keys.map((k) => `${k} = false`).join('\n');
 const GROK_CONFIG = `[cli]
 auto_update = false
 
 [features]
 telemetry = false
+
+[telemetry]
+trace_upload = false
+
+[memory]
+enabled = false
+
+[compat.claude]
+${off(['skills', 'rules', 'agents', 'mcps', 'hooks', 'sessions'])}
+
+[compat.cursor]
+${off(['skills', 'rules', 'agents', 'mcps', 'hooks', 'sessions'])}
+
+[compat.codex]
+${off(['sessions'])}
 `;
 /**
  * Grok (the official xAI CLI, `curl -fsSL https://x.ai/cli/install.sh | bash -s <version>`). Credentials in ~/.grok/auth.json, no

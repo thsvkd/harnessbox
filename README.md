@@ -78,7 +78,8 @@ What was verified (2026-10-16, this repository's code, Raspberry Pi 5, kernel 6.
   empty home; a fresh home reports logged out; the login starts in a proxy box and prints a URL on the adapter's login hosts (Claude
   `claude.com/cai/oauth/authorize`, Codex `auth.openai.com/codex/device` with a `XXXX-XXXXX` code, Grok `accounts.x.ai/oauth2/device`
   with a `XXXX-XXXX` code), then is canceled; none of these produced an egress denial, so their hosts are on the lists. Codex's own
-  sandbox starts in a nested box (`codex sandbox -- true`).
+  sandbox starts in a nested box (`codex sandbox -- true`). Grok reads the seeded `~/.grok/config.toml`: `grok inspect --json` shows
+  every Claude/Cursor/Codex compatibility cell off, from config.
 - **Isolation** (same run): another user's credential canary, home and /proc invisible; LAN, tailnet, Docker bridge, host loopback
   and direct internet unreachable; no capabilities, seccomp on, AF_VSOCK and io_uring EPERM, no nested user namespace; cleared
   environment; RLIMIT_NPROC 512, /tmp and /run 256 MiB; the proxy refuses another harness's host, port 80, an IP literal, an unlisted
