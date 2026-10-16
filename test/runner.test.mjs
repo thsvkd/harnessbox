@@ -11,7 +11,7 @@ import { Busy, claudeCode, codex, createRunner, grok } from '../src/index.mjs';
 
 const HERE = import.meta.dirname;
 const FAKE = { 'claude-code': join(HERE, 'fake-claude'), codex: join(HERE, 'fake-codex'), grok: join(HERE, 'fake-grok') };
-const canBox = spawnSync('bwrap', ['--unshare-all', '--die-with-parent', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--proc', '/proc', '--dev', '/dev', '/usr/bin/true']).status === 0;
+const canBox = spawnSync('bwrap', ['--unshare-all', '--die-with-parent', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc', '--dev', '/dev', '/usr/bin/true']).status === 0;
 const BOX = { skip: !canBox && 'needs bubblewrap with user namespaces' };
 const CRED = { 'claude-code': '.claude/.credentials.json', codex: '.codex/auth.json', grok: '.grok/auth.json' };
 const IDS = Object.keys(CRED);

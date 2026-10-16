@@ -201,7 +201,8 @@ export function seccompFilter(arch = process.arch) {
  */
 export function boxArgs({ home, dir, net, sock, socat, path, env = {}, roBinds = [], chdir, cmd, maxTasks = 512, nested = false, seccomp = false }) {
   const a = ['--die-with-parent', '--new-session', '--unshare-all', ...(nested ? [] : ['--unshare-user', '--disable-userns']), '--cap-drop', 'ALL', '--clearenv',
-    '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/sbin', '/sbin', '--symlink', 'usr/lib', '/lib', '--ro-bind', '/etc', '/etc',
+    '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/sbin', '/sbin', '--symlink', 'usr/lib', '/lib',
+    '--symlink', 'usr/lib64', '/lib64', '--ro-bind', '/etc', '/etc', // x64 ELF binaries need /lib64/ld-linux-x86-64.so.2
     '--proc', '/proc', '--dev', '/dev', '--size', String(BOX_TMP_BYTES), '--tmpfs', '/tmp', '--size', String(BOX_TMP_BYTES), '--tmpfs', '/run',
     '--bind', home, home, ...(dir ? ['--bind', dir, dir] : [])];
   for (const b of roBinds) a.push('--ro-bind', ...(Array.isArray(b) ? b : [b, b]));

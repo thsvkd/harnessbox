@@ -8,6 +8,7 @@
 - Cancel lock and slot waiters promptly. `close()` now cancels queued work, prevents new boxes, and can be awaited for cleanup.
 - Require the seccomp filter, bubblewrap and socat at startup; reject invalid resource limits and duplicate harness ids.
 - Serialize concurrent capability detection over the shared probe homes.
+- Expose the read-only `/usr/lib64` loader path at `/lib64` for x64 ELF binaries.
 - Include the probe, deployment kit, documentation and TypeScript declarations in package tarballs.
 - Add isolated consumer checks and CI that requires working bubblewrap user namespaces.
 

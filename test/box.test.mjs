@@ -235,7 +235,7 @@ test('seccompFilter: one 8-byte instruction per entry, arm64 and x64 only', () =
   assert.throws(() => seccompFilter('ia32'), /no seccomp filter/);
 });
 
-const canBox = spawnSync('bwrap', ['--unshare-all', '--die-with-parent', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--proc', '/proc', '--dev', '/dev', '/usr/bin/true']).status === 0;
+const canBox = spawnSync('bwrap', ['--unshare-all', '--die-with-parent', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc', '--dev', '/dev', '/usr/bin/true']).status === 0;
 const hasPython = spawnSync('python3', ['-c', '']).status === 0;
 test('seccompFilter in a real box: io_uring and AF_VSOCK refused, AF_UNIX, AF_INET and socketpair open, a foreign arch killed', { skip: !(canBox && hasPython) && 'needs bubblewrap with user namespaces and python3' }, async () => {
   const home = tmp();

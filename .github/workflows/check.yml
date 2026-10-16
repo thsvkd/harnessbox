@@ -23,6 +23,6 @@ jobs:
           if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --symlink usr/lib /lib --proc /proc --dev /dev /usr/bin/true
+          bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --proc /proc --dev /dev /usr/bin/true
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run check
