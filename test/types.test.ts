@@ -1,5 +1,6 @@
 // Compile the public consumer API. This file is never executed and never starts a real CLI.
 import { Busy, claudeCode, codex, createRunner, diskUse, grok, readOut, type Adapter, type RunResult } from 'harnessbox';
+import { harnessbox, HarnessboxError, type Run } from 'harnessbox/client';
 
 const custom: Adapter = {
   ...grok,
@@ -19,9 +20,20 @@ const url: string = waiting.url;
 void url;
 const result: RunResult = await runner.run('alice', 'custom', {
   prompt: 'hello', dir: '/jobs/1', signal: new AbortController().signal,
-  onEvent: async (event) => { if (event.type === 'end') console.log(event); },
+  onEvent: async (event, { stage }) => { if (event.type === 'end') console.log(event, stage); },
   roBinds: [['/validator', '/jobs/1/validator'] as const],
+  boxDir: '/work', model: 'sonnet', onStart: () => {},
 });
+await runner.exec('alice/u1', 'custom', ['true'], { dir: '/jobs/1', boxDir: '/work', home: '/tmp/empty', signal: new AbortController().signal });
+const hb = harnessbox({ socketPath: '/run/harnessbox/hb.sock', token: 't' });
+const started: Run = await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', files: [{ path: 'a.jpg', base64: '', copies: ['out/a.jpg'] }], outputs: ['out/x'], validate: { argv: ['true'] } });
+const ended: Run = await hb.events(started.id, (event, run) => { if (event === 'progress') console.log(run.stage); });
+const draft: string | null | undefined = ended.outputs?.['out/x'];
+void draft;
+const hbError: Error = new HarnessboxError(409, 'busy');
+void hbError;
+// @ts-expect-error validators never get a network
+hb.run({ user: 'u1', harness: 'codex', prompt: 'x', validate: { argv: ['true'], net: 'proxy' } });
 const count: number = result.usage.input;
 void count;
 await runner.exec('alice', 'custom', ['true'], { net: 'none' });

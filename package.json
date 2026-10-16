@@ -5,8 +5,14 @@
   "type": "module",
   "types": "./src/index.d.ts",
   "exports": {
-    "types": "./src/index.d.ts",
-    "default": "./src/index.mjs"
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.mjs"
+    },
+    "./client": {
+      "types": "./src/client.d.ts",
+      "default": "./src/client.mjs"
+    }
   },
   "files": [
     "src",

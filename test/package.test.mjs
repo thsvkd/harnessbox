@@ -17,9 +17,9 @@ test('a fresh consumer imports the packed library and can invoke its shipped pro
     mkdirSync(consumer);
     const install = run(['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', join(root, pack.filename)], consumer);
     assert.equal(install.status, 0, install.stderr);
-    const imported = spawnSync(process.execPath, ['--input-type=module', '-e', 'import { createRunner, readOut } from "harnessbox"; console.log(typeof createRunner, typeof readOut)'], { cwd: consumer, encoding: 'utf8' });
+    const imported = spawnSync(process.execPath, ['--input-type=module', '-e', 'import { createRunner, readOut } from "harnessbox"; import { harnessbox } from "harnessbox/client"; console.log(typeof createRunner, typeof readOut, typeof harnessbox)'], { cwd: consumer, encoding: 'utf8' });
     assert.equal(imported.status, 0, imported.stderr);
-    assert.equal(imported.stdout.trim(), 'function function');
+    assert.equal(imported.stdout.trim(), 'function function function');
     const types = join(consumer, 'consumer.mts'), project = join(import.meta.dirname, '..');
     writeFileSync(types, 'import {createRunner,grok,type RunResult} from "harnessbox";\nconst hb=await createRunner({homes:"/homes",adapters:[grok],maxOutputBytes:1024});\nconst r:RunResult=await hb.run("alice","grok",{prompt:"x",dir:"/jobs/1"});\nawait hb.close();\n');
     const typed = spawnSync(process.execPath, [join(project, 'node_modules/typescript/bin/tsc'), '--strict', '--noEmit', '--module', 'NodeNext', '--target', 'ES2023', '--typeRoots', join(project, 'node_modules/@types'), types], { cwd: consumer, encoding: 'utf8', timeout: 30000 });

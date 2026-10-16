@@ -33,7 +33,7 @@ async function world({ limits = {}, root = mkdtempSync(join(tmpdir(), 'hb-servic
   const logIn = (client, user, id) => { const f = join(homes, client, user, id, CRED[id]); mkdirSync(join(f, '..'), { recursive: true }); writeFileSync(f, '{"fake":true}'); };
   return {
     root, homes, runs, sock, logs, logIn, a: harnessbox({ socketPath: sock, token: TOKEN.a }), b: harnessbox({ socketPath: sock, token: TOKEN.b }),
-    close: async ({ keep = false } = {}) => { svc.close(); hb.close(); if (!keep) rmSync(root, { recursive: true, force: true }); },
+    close: async ({ keep = false } = {}) => { svc.close(); await hb.close(); if (!keep) rmSync(root, { recursive: true, force: true }); },
   };
 }
 const raw = (sock, method, path, headers = {}, body) => new Promise((done) => {

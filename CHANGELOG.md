@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- The service: `node src/server.mjs` (the image's default command) serves an HTTP API on a unix socket (or a private TCP port)
+  to client apps, each with its own bearer token and users under `/homes/<client>/<user>/<harness>`: harness status, logins
+  with URL/code relay, logout, purge, and runs with files in, read-only folders, outputs back, a no-network validator with an
+  empty home, SSE events and cancel (docs/service.md). `harnessbox/client` is its dependency-free client.
+- Runner: user ids may be `scope/user`; `run()` takes `boxDir`, `model`, `onStart`, and `onEvent` gets `{ stage }`; `exec()` takes
+  `boxDir`, `signal` and `home` (a throwaway home, no lock). `boxArgs()` takes `boxDir`.
+- Deploy: `deploy/service-smoke.mjs`, `deploy/move-homes.sh`; compose shows the service with a client app sharing the socket.
+
 ## 0.1.1
 
 - Stop boxes when disk usage cannot be inspected, and stream directory entries within the entry budget.

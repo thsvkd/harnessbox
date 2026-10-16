@@ -49,16 +49,24 @@ export interface DetectRow {
 export interface RunOptions {
   prompt: string; dir: string; timeoutMs?: number; args?: readonly string[]; env?: Env;
   roBinds?: readonly ReadOnlyBind[]; signal?: AbortSignal;
+  /** Where the box sees dir (default: the same path), e.g. '/work'. */
+  boxDir?: string;
+  /** Passed to the CLI as --model. */
+  model?: string;
+  /** The box started (after the user's lock and a job slot). */
+  onStart?: () => void;
   /** Notifications are fire-and-forget; synchronous errors and rejected promises are contained. */
-  onEvent?: (event: JsonEvent) => void | Promise<void>;
+  onEvent?: (event: JsonEvent, info: { stage: string }) => void | Promise<void>;
 }
 export interface RunResult {
   code: number; text: string; usage: Usage; error: string; stderr: string; why: string | null;
   timedOut: boolean; canceled: boolean; loggedIn?: boolean;
 }
 export interface ExecOptions {
-  net?: 'none' | 'proxy'; dir?: string; ms?: number; stdin?: string; env?: Env;
-  roBinds?: readonly ReadOnlyBind[]; nested?: boolean;
+  net?: 'none' | 'proxy'; dir?: string; boxDir?: string; ms?: number; stdin?: string; env?: Env;
+  roBinds?: readonly ReadOnlyBind[]; nested?: boolean; signal?: AbortSignal;
+  /** A throwaway home instead of the user's (no lock then): for a command someone else chose. */
+  home?: string;
 }
 export interface LoginWaiting { url: string; code: string | null; needsCode: boolean }
 export type LoginResult = { ok: true; status: Status } | { ok: false; error: string };
@@ -71,6 +79,7 @@ export interface LoginSession {
 export interface Box {
   child: ChildProcess; home: string; dir?: string; why: string | null; closed: Promise<number>; kill(): void;
 }
+/** userId is `user` or `scope/user`, each part [A-Za-z0-9_-]{1,64}; homes are <homes>/<userId>/<harness>. */
 export interface Runner {
   detect(): Promise<DetectRow[]>;
   status(userId: string, id: string, options?: { waitMs?: number }): Promise<Status>;
@@ -106,6 +115,6 @@ export function diskUse(roots: readonly string[], cap?: number): Promise<{ bytes
 export function seccompFilter(arch?: string): Buffer;
 export interface BoxOptions {
   home: string; path: string; cmd: readonly string[]; dir?: string; net?: 'none' | 'proxy'; sock?: string; socat?: string;
-  env?: Env; roBinds?: readonly ReadOnlyBind[]; chdir?: string; maxTasks?: number; nested?: boolean; seccomp?: boolean;
+  env?: Env; roBinds?: readonly ReadOnlyBind[]; chdir?: string; maxTasks?: number; nested?: boolean; seccomp?: boolean; boxDir?: string;
 }
 export function boxArgs(options: BoxOptions): string[];

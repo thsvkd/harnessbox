@@ -3,7 +3,8 @@
 `node src/server.mjs` (the image's default command) runs the runner behind an HTTP API, so web apps can let their users log in to
 Claude Code, Codex or Grok and run jobs with those subscriptions without ever holding a credential. Each app is a **client** with
 its own bearer token; its users live under `/homes/<client>/<user>/<harness>`, so two clients never see each other's users, even
-with the same user ids. `src/client.mjs` is a dependency-free client to copy into your app.
+with the same user ids. `src/client.mjs` is a dependency-free client: import it as `harnessbox/client` (types in
+`src/client.d.ts`) or copy both files into your app.
 
 ## Configuration (environment)
 
@@ -143,7 +144,7 @@ Its existing homes (`/homes/<userId>/.claude/.credentials.json`, `.claude.json`,
 ## Client module
 
 ```js
-import { harnessbox } from './harnessbox-client.mjs'; // a copy of src/client.mjs
+import { harnessbox } from 'harnessbox/client'; // or a copy of src/client.mjs
 const hb = harnessbox({ socketPath: '/run/harnessbox/hb.sock', token: process.env.HARNESSBOX_TOKEN });
 const login = await hb.login('u_123', 'codex');                 // show login.url and login.code
 const { id } = await hb.run({ user: 'u_123', harness: 'codex', prompt: '…', files, outputs: ['out/draft.json'] });

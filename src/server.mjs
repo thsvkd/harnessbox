@@ -352,6 +352,6 @@ async function main() {
   // the socket's folder is a volume shared with the client apps only; the bearer token is the other half
   if (!tcp) await chmod(listen, 0o666);
   log(`listening on ${listen} for ${clients.length} client(s)`);
-  for (const sig of ['SIGINT', 'SIGTERM']) process.once(sig, () => { svc.close(); hb.close(); process.kill(process.pid, sig); });
+  for (const sig of ['SIGINT', 'SIGTERM']) process.once(sig, () => { svc.close(); void hb.close().finally(() => process.kill(process.pid, sig)); });
 }
 if (import.meta.main) await main();
