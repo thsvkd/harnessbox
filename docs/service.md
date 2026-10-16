@@ -19,6 +19,7 @@ with the same user ids. `src/client.mjs` is a dependency-free client: import it 
 | `HB_MODELS_<ID>` | any | Comma list of allowed `model` values for that harness. |
 | `HB_MAX_JOBS` | 3 | CLI runs at once, all clients together. More wait (queued). |
 | `HB_MAX_QUICK` | 4 | Status and logout boxes at once. |
+| `HB_MAX_OUTPUT_BYTES` | 8 MiB | A run's CLI stdout and stderr together; past it the box is stopped (`result.why`). Claude Code's stream-json carries every image it reads, so raise it for jobs with many photos. A positive integer, else the service does not start. |
 | `HB_MAX_BODY` | 64 MiB | Request body cap; the decoded files of a run may take three quarters of it. Size the container's `/tmp` tmpfs for `HB_MAX_JOBS` runs of that. |
 | `HB_BWRAP`, `HB_SOCAT` | on PATH | |
 

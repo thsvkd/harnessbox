@@ -185,14 +185,16 @@ test('service: cancel, caps, bad requests, purge, and a restart forgets runs', B
   } finally { await w.close(); }
 });
 
-test('main: configured from the environment, a 0666 socket, stale run folders removed at start, SIGTERM ends it', BOX, async () => {
+test('main: configured from the environment, a 0666 socket, stale run folders removed at start, an output cap, SIGTERM ends it', BOX, async () => {
   const root = mkdtempSync(join(tmpdir(), 'hb-service-main-')), sock = join(root, 'sock', 'hb.sock'), runs = join(root, 'runs');
   mkdirSync(join(runs, 'run_old-x', 'work'), { recursive: true });
+  mkdirSync(join(root, 'homes', 'appa', 'u1', 'codex', '.codex'), { recursive: true });
+  writeFileSync(join(root, 'homes', 'appa', 'u1', 'codex', '.codex', 'auth.json'), '{"fake":true}');
   writeFileSync(join(root, 'clients.json'), JSON.stringify({ clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a), harnesses: ['codex'] }] }));
   const { spawn } = await import('node:child_process');
   const child = spawn(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { stdio: ['ignore', 'pipe', 'pipe'], env: {
     PATH: process.env.PATH, HB_LISTEN: sock, HB_CLIENTS: join(root, 'clients.json'), HB_HOMES: join(root, 'homes'), HB_RUNS: runs, HB_HARNESSES: 'codex',
-    HB_BIN_CODEX: FAKE.codex, HB_SOCAT: join(HERE, 'fake-socat'), HB_PIN_CODEX: '0.162.1' } });
+    HB_BIN_CODEX: FAKE.codex, HB_SOCAT: join(HERE, 'fake-socat'), HB_PIN_CODEX: '0.162.1', HB_MAX_OUTPUT_BYTES: '2000' } });
   let out = '';
   child.stdout.on('data', (d) => { out += d; });
   child.stderr.on('data', (d) => { out += d; });
@@ -202,11 +204,24 @@ test('main: configured from the environment, a 0666 socket, stale run folders re
     const { statSync } = await import('node:fs');
     assert.equal(statSync(sock).mode & 0o777, 0o666);
     assert.deepEqual(readdirSync(runs), []);
-    assert.deepEqual((await harnessbox({ socketPath: sock, token: TOKEN.a }).harnesses()).harnesses.map((h) => h.id), ['codex']);
+    const hb = harnessbox({ socketPath: sock, token: TOKEN.a });
+    assert.deepEqual((await hb.harnesses()).harnesses.map((h) => h.id), ['codex']);
+    // HB_MAX_OUTPUT_BYTES reaches the runner: 5000 bytes of stderr stop a box capped at 2000
+    const loud = await hb.events((await hb.run({ user: 'u1', harness: 'codex', prompt: 'FAKE_MODE=loud' })).id);
+    assert.deepEqual([loud.state, loud.result.why], ['failed', 'more than 2000 output bytes: box stopped']);
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => child.on('exit', r));
     rmSync(root, { recursive: true, force: true });
   }
   assert.equal(child.signalCode, 'SIGTERM', out);
+});
+
+test('main: a bad HB_MAX_OUTPUT_BYTES stops the service at start', async () => {
+  for (const value of ['0', '-1', '1.5', '8MiB', '']) {
+    const r = spawnSync(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { encoding: 'utf8', timeout: 30e3,
+      env: { PATH: process.env.PATH, HB_MAX_OUTPUT_BYTES: value, HB_CLIENTS: '/nonexistent/clients.json' } });
+    assert.notEqual(r.status, 0, value);
+    assert.match(r.stderr, /HB_MAX_OUTPUT_BYTES must be a positive integer/, value);
+  }
 });

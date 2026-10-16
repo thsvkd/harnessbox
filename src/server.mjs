@@ -331,6 +331,9 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
 // ---- main: configuration from the environment (docs/service.md)
 async function main() {
   const env = process.env, all = [claudeCode, codex, grok];
+  // a run's stdout + stderr together (Claude's stream-json carries every image it reads); unset: the runner's 8 MiB
+  const outputBytes = env.HB_MAX_OUTPUT_BYTES === undefined ? undefined : Number(env.HB_MAX_OUTPUT_BYTES);
+  if (outputBytes !== undefined && (!/^[1-9][0-9]*$/.test(env.HB_MAX_OUTPUT_BYTES) || !Number.isSafeInteger(outputBytes))) throw new Error('HB_MAX_OUTPUT_BYTES must be a positive integer (bytes)');
   const want = (env.HB_HARNESSES ?? all.map((a) => a.id).join(',')).split(',');
   const adapters = all.filter((a) => want.includes(a.id)), envKey = (a) => a.id.toUpperCase().replace(/-/g, '_');
   const pick = (prefix) => Object.fromEntries(adapters.flatMap((a) => (env[`${prefix}${envKey(a)}`] ? [[a.id, env[`${prefix}${envKey(a)}`]]] : [])));
@@ -341,7 +344,7 @@ async function main() {
   await mkdir(runs, { recursive: true, mode: 0o700 });
   for (const n of await readdir(runs)) await rm(join(runs, n), { recursive: true, force: true });
   const hb = await createRunner({ homes: env.HB_HOMES ?? '/homes', adapters, bins: pick('HB_BIN_'), pins: pick('HB_PIN_'), bwrap: env.HB_BWRAP ?? 'bwrap', socat: env.HB_SOCAT ?? 'socat',
-    maxJobs: Number(env.HB_MAX_JOBS) || 3, maxQuick: Number(env.HB_MAX_QUICK) || 4, log });
+    maxJobs: Number(env.HB_MAX_JOBS) || 3, maxQuick: Number(env.HB_MAX_QUICK) || 4, maxOutputBytes: outputBytes, log });
   const harnesses = await hb.detect();
   for (const h of harnesses) log(`${h.id} ${h.version ?? '-'} ${h.usable ? 'usable' : `not usable: ${h.why}`}`);
   const models = Object.fromEntries(Object.entries(pick('HB_MODELS_')).map(([k, v]) => [k, v.split(',')]));

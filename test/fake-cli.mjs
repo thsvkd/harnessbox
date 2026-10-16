@@ -12,7 +12,7 @@
 // sleeping children), plant (shell and settings files in the home, a credential file replaced by a link), egress (CONNECT
 // example.com:443 through the box's proxy), symlink (codex: the last-message file is a link to FAKE_TARGET), junk (JSON lines that
 // are not objects and a result with non-numeric usage before the usual events), rva (review-automation's draft job: out/draft.json,
-// draft.md, handoff.md, a try at rewriting skill/validate.sh, out/evil.json linked to the credential, a 50000-byte out/big.txt). FAKE_LOGIN_NOURL: `claude auth login` exits 0 at once.
+// draft.md, handoff.md, a try at rewriting skill/validate.sh (loud: 5000 bytes on stderr first), out/evil.json linked to the credential, a 50000-byte out/big.txt). FAKE_LOGIN_NOURL: `claude auth login` exits 0 at once.
 import { spawn, spawnSync } from 'node:child_process';
 import { accessSync, chmodSync, existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
@@ -113,6 +113,7 @@ export async function main(kind) {
   }
   if (mode === 'expired') { console.log(JSON.stringify({ type: 'result', is_error: true, result: 'Login expired · Please run /login', usage: { input_tokens: 0, output_tokens: 0 } })); return process.exit(1); }
   if (mode === 'fail') { console.error('fake failure'); return process.exit(3); }
+  if (mode === 'loud') { process.stderr.write('x'.repeat(5000)); await sleep(1000); }
   if (mode === 'hang') return hang();
   if (mode === 'burst-exit') {
     await sleep(20);
