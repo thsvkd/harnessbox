@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+// A stand-in for socat in runner.test.mjs (a test host may have none). It does exactly what the box's bridge asks of socat:
+// TCP-LISTEN:<port>,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:<path>, i.e. every loopback connection piped to the unix socket.
+import net from 'node:net';
+const [listen, unix] = process.argv.slice(2);
+const port = Number(/^TCP-LISTEN:(\d+),bind=127\.0\.0\.1,fork,reuseaddr$/.exec(listen ?? '')?.[1]), path = /^UNIX-CONNECT:(.+)$/.exec(unix ?? '')?.[1];
+if (!port || !path) { console.error('fake-socat: unsupported arguments'); process.exit(2); }
+net.createServer((s) => {
+  const u = net.connect(path);
+  s.on('error', () => u.destroy());
+  u.on('error', () => s.destroy());
+  s.pipe(u).pipe(s);
+}).listen(port, '127.0.0.1');

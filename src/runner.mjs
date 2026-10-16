@@ -1,0 +1,351 @@
+// The runner: each user gets a persistent home per harness (<homes>/<userId>/<harnessId>), and every login, status, logout and job
+// runs in a fresh bubblewrap box over that home (box.mjs) that reaches the internet only through a CONNECT proxy in this process for
+// the harness's own hosts. The host app never sees a credential: the CLI writes it into the user's home itself, and only the login
+// URL (and a device code, or the code the user pastes back) passes through. No dependencies, Node 24, Linux with bubblewrap.
+import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { constants } from 'node:fs';
+import { access, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { boxArgs, countDescendants, diskUse, ID, readOut, scrubHome, seccompFilter, startProxy } from './box.mjs';
+
+const LOGIN_MS = 10 * 60e3, PROBE_MS = 30e3;
+const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g, CODE = /^[\x21-\x7e]{1,2048}$/;
+
+/** A status or logout that could not get the user's lock (or a quick-box slot) in time: ask again later. */
+export class Busy extends Error {}
+
+async function which(bin) {
+  for (const d of bin.includes('/') ? [''] : (process.env.PATH ?? '').split(':').filter(Boolean)) {
+    const p = resolve(d, bin);
+    try { await access(p, constants.X_OK); return await realpath(p); } catch { /* next */ }
+  }
+  return null;
+}
+const outside = (p) => (p && p !== '/usr' && !p.startsWith('/usr/') ? [p] : []);
+
+// One lock per key: a login, status, logout or job of one user's harness never overlaps another (the CLIs rotate refresh tokens: two
+// refreshes at once log the user out). Resolves to release(), or to null when ms passed first (that place in line is then given up).
+function locker() {
+  const locks = new Map();
+  return (key, ms = Infinity) => {
+    const prev = locks.get(key) ?? Promise.resolve();
+    let release, late = false;
+    const mine = new Promise((r) => { release = r; }), tail = prev.then(() => mine);
+    locks.set(key, tail);
+    void tail.then(() => { if (locks.get(key) === tail) locks.delete(key); });
+    return new Promise((done) => {
+      const t = ms === Infinity ? null : setTimeout(() => { late = true; done(null); }, ms);
+      void prev.then(() => { clearTimeout(t); if (late) release(); else done(release); });
+    });
+  };
+}
+
+/**
+ * @param {object} o
+ * @param {string} o.homes  root of the per-user homes (one uid owns them all: the box is the boundary)
+ * @param {import('./adapters.mjs').Adapter[]} o.adapters
+ * @param {Record<string,string>} [o.bins]   binary per harness id (default: the adapter's bin on PATH)
+ * @param {Record<string,string>} [o.pins]   exact version per harness id; another version is not usable
+ * @param {string} [o.bwrap]  @param {string} [o.socat]
+ * @param {number} [o.maxJobs]  jobs at once (more wait for a slot)   @param {number} [o.maxQuick]  status/logout boxes at once (else Busy)
+ * @param {number} [o.maxProcs]  processes per box (watchdog; the in-box RLIMIT_NPROC is 4x for threads)
+ * @param {number} [o.maxBytes]  home + job folder per box   @param {number} [o.maxEntries]
+ * @param {(line: string) => void} [o.log]  egress denials and watchdog notes (never credentials, codes or URLs)
+ * @param {Record<string,string>} [o.passEnv]  extra variables for every box (tests)
+ */
+export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwrap = 'bwrap', socat = 'socat', maxJobs = 3, maxQuick = 2, maxProcs = 128,
+  maxBytes = 2 ** 30, maxEntries = 20000, log = () => {}, passEnv = {} }) {
+  const byId = new Map(adapters.map((a) => [a.id, a]));
+  for (const a of adapters) if (!ID.test(a.id)) throw new Error(`bad harness id ${a.id}`);
+  const BIN = Object.fromEntries(await Promise.all(adapters.map(async (a) => [a.id, await which(bins[a.id] ?? a.bin)])));
+  const SOCAT = await which(socat) ?? socat;
+  // what of this host the boxes need read-only besides /usr: the CLIs' folders and Node's (a host's nvm node; in an image all is in /usr)
+  const NODE_DIR = dirname(dirname(process.execPath));
+  const BIN_DIRS = [...new Set([dirname(process.execPath), ...[...Object.values(BIN), SOCAT].filter((b) => b?.includes('/')).map((b) => dirname(b))])];
+  const RO = [...new Set([...outside(NODE_DIR), ...BIN_DIRS.filter((d) => !`${d}/`.startsWith(`${NODE_DIR}/`)).flatMap(outside)])];
+  const PATH_IN_BOX = [...BIN_DIRS.filter((d) => outside(d).length), '/usr/local/bin', '/usr/bin', '/bin'].join(':');
+  let filter = null;
+  try { filter = seccompFilter(); } catch (e) { log(`no box seccomp filter: ${e.message}`); }
+
+  const lock = locker();
+  const key = (userId, a) => `${userId}/${a.id}`;
+  const homeOf = (userId, a) => join(homes, userId, a.id);
+  const cli = (a, args) => [BIN[a.id], ...(a.globalArgs ?? []), ...args];
+  const harness = (id) => { const a = byId.get(id); if (!a) throw new Error(`unknown harness ${id}`); return a; };
+  const user = (userId) => { if (!ID.test(userId ?? '')) throw new Error('bad user id'); return userId; };
+  let detected = new Map(); // id -> detect() row
+  const usable = (id) => { const a = harness(id); if (!detected.get(id)?.usable) throw new Error(`${a.name} is not usable on this runner`); return a; };
+
+  // ---- boxes
+  const boxes = new Map(); // bwrap pid -> box, for the watchdog and close()
+  /** One box over one home, scrubbed to the harness's credentials (and seeded) first; with net 'proxy' a proxy of its own for the
+   *  harness's hosts. Resolves to { child, closed (exit code), kill, why (set when the watchdog stopped it) }. */
+  async function spawnBox(a, { home, net = 'none', dir, cmd, stdin = 'ignore', env = {}, label, roBinds = [], nested = false }) {
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    await scrubHome(home, a.keep, a.keepJsonKeys);
+    for (const [rel, text] of Object.entries(a.seed ?? {})) {
+      await mkdir(dirname(join(home, rel)), { recursive: true, mode: 0o700 });
+      await writeFile(join(home, rel), text, { flag: 'wx', mode: 0o600 }); // the scrub removed whatever was there
+    }
+    let proxy = null, sock = null;
+    if (net === 'proxy') {
+      sock = join(tmpdir(), `hb-egress-${randomBytes(8).toString('hex')}.sock`);
+      proxy = await startProxy(sock, { allow: a.hosts, label, log });
+    }
+    // the kernel's per-box cap counts threads too (a CLI has a few dozen): the watchdog counts processes against maxProcs
+    const args = boxArgs({ home, dir, net, sock, socat: SOCAT, path: PATH_IN_BOX, env: { ...passEnv, ...a.env, ...env }, roBinds: [...RO, ...roBinds], chdir: dir ?? home,
+      cmd, maxTasks: maxProcs * 4, nested, seccomp: !!filter });
+    const child = spawn(bwrap, args, { stdio: [stdin, 'pipe', 'pipe', ...(filter ? ['pipe'] : [])], env: { PATH: process.env.PATH } });
+    if (filter) child.stdio[3].on('error', () => {}).end(filter);
+    // Stopping a box is SIGKILL to bwrap: --die-with-parent takes everything in it (it is a session of its own, so a group kill would not).
+    const b = { child, home, dir, why: null, kill: () => { try { child.kill('SIGKILL'); } catch { /* gone */ } } };
+    child.stdin?.on('error', () => {});
+    if (child.pid) boxes.set(child.pid, b);
+    b.closed = new Promise((done) => { child.on('error', () => done(-1)); child.on('close', (c) => done(c ?? -1)); }).then(async (code) => {
+      boxes.delete(child.pid);
+      if (proxy) { proxy.close(); await rm(sock, { force: true }); }
+      return code;
+    });
+    return b;
+  }
+  /** A short command in a box: { code, out (64 KB at most, stdout and stderr), why }. */
+  async function short(a, cmd, { ms = PROBE_MS, stdin, ...o }) {
+    const b = await spawnBox(a, { ...o, cmd, stdin: stdin == null ? 'ignore' : 'pipe' });
+    if (stdin != null) b.child.stdin.end(stdin);
+    let out = '';
+    const take = (d) => { if (out.length < 65536) out += d; };
+    b.child.stdout.on('data', take);
+    b.child.stderr.on('data', take);
+    const t = setTimeout(b.kill, ms);
+    const code = await b.closed;
+    clearTimeout(t);
+    return { code, out, why: b.why };
+  }
+
+  // The watchdog: every 2 s, each box's process count (the in-box RLIMIT_NPROC is the hard cap; this names the reason and stops it)
+  // and the size of its home and folder (a job folder on a tmpfs counts against memory; homes share a disk). Over a limit: killed.
+  let watching = false;
+  const watchdog = setInterval(async () => {
+    if (!boxes.size || watching) return;
+    watching = true;
+    try {
+      const counts = await countDescendants([...boxes.keys()]);
+      for (const [pid, b] of boxes) {
+        if ((counts.get(pid) ?? 0) > maxProcs) { b.why ??= `more than ${maxProcs} processes: box stopped`; b.kill(); continue; }
+        const u = await diskUse([b.home, ...(b.dir ? [b.dir] : [])], maxEntries);
+        if (u.bytes > maxBytes || u.entries > maxEntries) { b.why ??= `more than ${maxBytes} bytes or ${maxEntries} files: box stopped`; b.kill(); }
+      }
+    } catch (e) { log(`watchdog: ${e.message}`); } finally { watching = false; }
+  }, 2000);
+  watchdog.unref();
+
+  // ---- detect: which harnesses this runner can run, by version pin, the options the commands need and the harness's own checks, in a
+  // box with no network and an empty home
+  async function detect() {
+    const rows = new Map();
+    for (const a of adapters) {
+      const r = { id: a.id, name: a.name, bin: BIN[a.id], version: null, usable: false, why: null, has: new Set() }, home = join(homes, '.probe', a.id);
+      const run = (args, nested = false) => short(a, cli(a, args), { home, label: 'probe', nested });
+      try {
+        if (!r.bin) { r.why = 'binary not found'; continue; }
+        const v = await run(['--version']);
+        r.version = /\d+\.\d+\.\d+/.exec(v.out)?.[0] ?? null;
+        if (v.code !== 0 || !r.version) { r.why = `--version failed (exit ${v.code})`; continue; }
+        if (pins[a.id] && pins[a.id] !== r.version) { r.why = `version ${r.version}, pinned ${pins[a.id]}`; continue; }
+        if (a.flags) {
+          const help = (await run(a.flags.args)).out, missing = a.flags.needs.filter((f) => !help.includes(f));
+          for (const f of a.flags.optional ?? []) if (help.includes(f)) r.has.add(f);
+          if (missing.length) { r.why = `missing options: ${missing.join(' ')}`; continue; }
+        }
+        for (const c of a.checks ?? []) if (!r.why && (await run(c.args, c.nested)).code !== 0) r.why = c.why;
+        r.usable = !r.why;
+      } finally {
+        rows.set(a.id, r);
+      }
+    }
+    await rm(join(homes, '.probe'), { recursive: true, force: true });
+    detected = rows;
+    return [...rows.values()];
+  }
+
+  // ---- status, logout, purge
+  async function statusIn(userId, a) {
+    const r = await short(a, cli(a, a.status.args), { home: homeOf(userId, a), net: 'proxy', label: `status=${userId}` });
+    if (r.why) throw new Error(r.why);
+    return { installed: true, ...a.status.parse(r) };
+  }
+  let quick = 0;
+  /** A quick box under the user's lock: never queued behind a long job (Busy after waitMs) nor past maxQuick at once. */
+  async function quickly(userId, a, waitMs, fn) {
+    if (quick >= maxQuick) throw new Busy('busy');
+    quick++;
+    try {
+      const release = await lock(key(userId, a), waitMs);
+      if (!release) throw new Busy('busy');
+      try { return await fn(); } finally { release(); }
+    } finally { quick--; }
+  }
+  /** The CLI's own login state in the user's box: { installed, loggedIn, method, plan }. */
+  async function status(userId, id, { waitMs = 5e3 } = {}) {
+    const a = harness(id);
+    user(userId);
+    if (!detected.get(id)?.usable) return { installed: false, loggedIn: false, method: null, plan: null };
+    return quickly(userId, a, waitMs, () => statusIn(userId, a));
+  }
+  /** The CLI's own logout in the user's box, then its status. */
+  async function logout(userId, id, { waitMs = 5e3 } = {}) {
+    const a = usable(id);
+    user(userId);
+    return quickly(userId, a, waitMs, async () => {
+      const r = await short(a, cli(a, a.logout), { home: homeOf(userId, a), net: 'proxy', label: `logout=${userId}` });
+      if (r.why) throw new Error(r.why);
+      return statusIn(userId, a);
+    });
+  }
+  /** Remove the user's homes (every harness): a waiting login ends, a running job ends first (its lock). */
+  async function purge(userId) {
+    user(userId);
+    for (const [k, s] of logins) if (k.startsWith(`${userId}/`)) s.cancel();
+    const releases = [];
+    for (const a of adapters) releases.push(await lock(key(userId, a)));
+    try { await rm(join(homes, userId), { recursive: true, force: true }); } finally { releases.forEach((r) => r()); }
+  }
+
+  // ---- login: the CLI's own login in the user's box. paste-code: a URL, then the code the login page shows goes to the CLI's stdin
+  // once; device-code: a URL and a one-time code, then the CLI finishes by itself. Only those and the outcome come out; nothing of it
+  // is logged.
+  const logins = new Map(); // key -> session
+  /**
+   * @returns {{ state: 'starting'|'waiting'|'done'|'failed', url: string|null, code: string|null, needsCode: boolean, error?: string,
+   *   waiting: Promise<{url: string, code: string|null, needsCode: boolean}>, done: Promise<{ok: boolean, status?: object, error?: string}>,
+   *   submitCode(code: string): boolean, cancel(): void }}
+   */
+  function login(userId, id) {
+    const a = usable(id), k = key(user(userId), a);
+    logins.get(k)?.cancel(); // the app forgot it (a restart, a late reply): the new one wins
+    let b = null, sent = false, canceled = false, settle;
+    const s = {
+      state: 'starting', url: null, code: null, needsCode: a.login.kind === 'paste-code',
+      waiting: new Promise((ok, no) => { settle = { ok, no }; }),
+      submitCode(code) {
+        if (s.state !== 'waiting' || !s.needsCode || sent || typeof code !== 'string' || !CODE.test(code)) return false;
+        sent = true;
+        b.child.stdin.write(`${code}\n`);
+        return true;
+      },
+      cancel() { canceled = true; b?.kill(); },
+    };
+    s.waiting.catch(() => {}); // a login that fails before its URL: the reason is in done
+    const end = (r) => {
+      s.state = r.ok ? 'done' : 'failed';
+      if (!r.ok) { s.error = r.error; settle.no(new Error(r.error)); }
+      return r;
+    };
+    logins.set(k, s);
+    s.done = (async () => {
+      const release = await lock(k);
+      let timedOut = false;
+      try {
+        if (canceled) return end({ ok: false, error: 'canceled' });
+        b = await spawnBox(a, { home: homeOf(userId, a), net: 'proxy', cmd: cli(a, a.login.args), stdin: 'pipe', label: `login=${userId}` });
+        if (canceled) b.kill();
+        let seen = '';
+        const read = (d) => {
+          if (s.state !== 'starting') return; // all that is needed went: the rest is dropped
+          seen = (seen + d).replace(ANSI, '').slice(-4096);
+          const got = a.login.parse(seen);
+          if (!got) return;
+          const u = URL.parse(got.url);
+          if (u?.protocol !== 'https:' || !a.login.urlHosts.includes(u.hostname)) { s.state = 'refused'; b.kill(); return; }
+          Object.assign(s, { state: 'waiting', url: got.url, code: got.code ?? null });
+          seen = '';
+          settle.ok({ url: s.url, code: s.code, needsCode: s.needsCode });
+        };
+        b.child.stdout.on('data', read);
+        b.child.stderr.on('data', read);
+        const t = setTimeout(() => { timedOut = true; b.kill(); }, LOGIN_MS);
+        const exit = await b.closed;
+        clearTimeout(t);
+        if (canceled) return end({ ok: false, error: 'canceled' });
+        if (b.why) return end({ ok: false, error: b.why });
+        if (s.state === 'refused') return end({ ok: false, error: 'the login URL is not on the harness\'s list of login hosts' });
+        if (timedOut) return end({ ok: false, error: 'the login did not finish within 10 minutes' });
+        if (exit !== 0) return end({ ok: false, error: `the login failed (exit ${exit})` });
+        return end({ ok: true, status: await statusIn(userId, a) });
+      } catch (e) {
+        return end({ ok: false, error: e.message });
+      } finally {
+        if (logins.get(k) === s) logins.delete(k);
+        release();
+      }
+    })();
+    return s;
+  }
+
+  // ---- jobs
+  let jobs = 0;
+  const queue = [];
+  const slot = () => (jobs < maxJobs ? (jobs++, Promise.resolve()) : new Promise((r) => queue.push(r)));
+  const free = () => { const next = queue.shift(); if (next) next(); else jobs--; };
+  /**
+   * One non-interactive run in the user's box: the harness's hardened command (adapter.job) plus args, in dir (writable, the cwd;
+   * TMPDIR is dir/.tmp). Waits for a job slot and the user's lock. Never rejects for the CLI's own failure: { code, text, usage
+   * ({input, output[, unknown]}), error, stderr (tail), why (watchdog), timedOut, canceled, loggedIn (after a failure: false when the
+   * login is gone, else the CLI's status) }. roBinds: read-only paths in the box (e.g. a pristine skill over dir/skill).
+   */
+  async function run(userId, id, { prompt, dir, timeoutMs = 40 * 60e3, args = [], env = {}, roBinds = [], signal, onEvent } = {}) {
+    const a = usable(id), k = key(user(userId), a);
+    if (typeof prompt !== 'string' || !prompt || prompt.startsWith('-')) throw new Error('prompt must be a non-empty string not starting with "-"');
+    dir = await realpath(dir); // the adapter's paths and readOut compare against the real path
+    await slot();
+    let release = null;
+    try {
+      release = await lock(k);
+      const tmp = join(dir, '.tmp');
+      await mkdir(tmp, { recursive: true });
+      const c = a.job.command({ prompt, dir, has: detected.get(id).has, extra: args });
+      const b = await spawnBox(a, { home: homeOf(userId, a), net: 'proxy', dir, cmd: cli(a, c.args), stdin: c.stdin == null ? 'ignore' : 'pipe',
+        env: { TMPDIR: tmp, TMP: tmp, TEMP: tmp, ...env }, label: `job=${userId}`, roBinds, nested: !!a.nested });
+      if (c.stdin != null) b.child.stdin.end(c.stdin);
+      const acc = { text: '', usage: { input: 0, output: 0 }, reports: 0, error: '', stage: '' };
+      let out = '', err = '', timedOut = false, canceled = false;
+      // one JSON event a line; a line that does not parse (cut off by a stop, say) is skipped
+      const line = (l) => { let e; try { e = JSON.parse(l); } catch { return; } a.job.event(e, acc); onEvent?.(e); };
+      b.child.stdout.on('data', (d) => { const lines = (out + d).split('\n'); out = lines.pop().slice(-1e6); lines.forEach(line); });
+      b.child.stderr.on('data', (d) => { err = (err + d).slice(-4000); });
+      const abort = () => { canceled = true; b.kill(); };
+      if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, { once: true });
+      const limit = setTimeout(() => { timedOut = true; b.kill(); }, timeoutMs);
+      const code = await b.closed;
+      clearTimeout(limit);
+      signal?.removeEventListener('abort', abort);
+      line(out);
+      await a.job.finish?.(acc, { dir, readOut });
+      const r = { code, text: acc.text, usage: acc.reports ? acc.usage : { ...acc.usage, unknown: true }, error: acc.error, stderr: err, why: b.why, timedOut, canceled };
+      // the CLI's own login as it stands now, so a login that expired shows (status alone may only see that credentials exist)
+      if (!b.why && !timedOut && !canceled && code !== 0) r.loggedIn = a.expired?.test(`${acc.error} ${err}`) ? false : (await statusIn(userId, a).catch(() => null))?.loggedIn;
+      return r;
+    } finally {
+      if (release) { await scrubHome(homeOf(userId, a), a.keep, a.keepJsonKeys).catch(() => {}); release(); }
+      free();
+    }
+  }
+
+  /** Any command in the user's box for a harness (a validator over a job's output, say), under the user's lock: { code, out, why }.
+   *  net 'none' by default; 'proxy' gives the harness's hosts. */
+  async function exec(userId, id, argv, { net = 'none', dir, ms = 60e3, stdin, env, roBinds, nested = false } = {}) {
+    const a = harness(id), k = key(user(userId), a);
+    const release = await lock(k);
+    try { return await short(a, argv, { home: homeOf(userId, a), net, dir: dir && await realpath(dir), ms, stdin, env, roBinds, nested, label: `exec=${userId}` }); } finally { release(); }
+  }
+
+  /** Stop every box and the watchdog (a runner that ends: SIGTERM). */
+  function close() {
+    clearInterval(watchdog);
+    for (const b of boxes.values()) b.kill();
+  }
+
+  return { detect, status, login, logout, purge, run, exec, close, boxes, bin: (id) => BIN[harness(id).id] };
+}
