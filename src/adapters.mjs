@@ -34,6 +34,7 @@ const deviceCode = (t) => {
   const url = URL_RE.exec(t)?.[0], code = url && DEVICE_CODE.exec(t.slice(t.indexOf(url) + url.length))?.[0];
   return code ? { url, code } : null;
 };
+const n = (x) => (Number.isFinite(x) ? x : 0); // a usage number from the box, or 0
 const EXPIRED = /Login expired|Not logged in|Please run \/login|invalid_grant|token (has )?expired|401 Unauthorized/i;
 
 // ~/.claude.json keeps Claude Code's account record next to user-scope settings a box could plant (mcpServers, per-folder trust under
@@ -74,8 +75,8 @@ export const claudeCode = {
       if (e?.type !== 'result') return;
       const u = e.usage ?? {};
       acc.reports++;
-      acc.usage.input += (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
-      acc.usage.output += u.output_tokens ?? 0;
+      acc.usage.input += n(u.input_tokens) + n(u.cache_creation_input_tokens) + n(u.cache_read_input_tokens);
+      acc.usage.output += n(u.output_tokens);
       if (typeof e.result === 'string') acc.text = e.result;
       if (e.is_error === true && typeof e.result === 'string') acc.error = e.result.replace(/\s+/g, ' ').trim().slice(0, 200);
     },
@@ -113,7 +114,7 @@ export const codex = {
     }),
     event: (e, acc) => {
       if (e.item?.type) acc.stage = CODEX_STAGE[e.item.type] ?? String(e.item.type).slice(0, 40);
-      if (e.type === 'turn.completed' && e.usage) { acc.reports++; acc.usage.input += e.usage.input_tokens ?? 0; acc.usage.output += e.usage.output_tokens ?? 0; }
+      if (e.type === 'turn.completed' && e.usage) { acc.reports++; acc.usage.input += n(e.usage.input_tokens); acc.usage.output += n(e.usage.output_tokens); }
       if (e.type === 'error' && typeof e.message === 'string') acc.error = e.message.slice(0, 200);
     },
     // the last message, from the file -o wrote in the job folder (readOut: never through a link the box made)
@@ -156,8 +157,8 @@ export const grok = {
       if ((e.type === 'end' || e.type === 'error') && e.usage) {
         const u = e.usage;
         acc.reports++;
-        acc.usage.input += (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
-        acc.usage.output += u.output_tokens ?? 0;
+        acc.usage.input += n(u.input_tokens) + n(u.cache_read_input_tokens) + n(u.cache_creation_input_tokens);
+        acc.usage.output += n(u.output_tokens);
       }
       if (e.type === 'error' && typeof e.message === 'string') acc.error = e.message.replace(/\s+/g, ' ').trim().slice(0, 200);
     },

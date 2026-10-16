@@ -117,6 +117,13 @@ test('login: a URL off the harness\'s login hosts, a wrong code, cancel and a ne
     assert.equal(b.state, 'failed');
     assert.ok(!existsSync(join(w.home('alice', 'codex'), CRED.codex)) && !existsSync(join(w.home('alice', 'claude-code'), CRED['claude-code'])));
   } finally { w.close(); }
+  w = await world({ env: { FAKE_LOGIN_NOURL: '1' } });
+  try {
+    await w.hb.detect();
+    const s = w.hb.login('alice', 'claude-code');
+    await assert.rejects(s.waiting, /without a URL/, 'waiting settles when the CLI ends before printing a URL');
+    assert.equal((await s.done).ok, true);
+  } finally { w.close(); }
 });
 
 test('run: each harness\'s hardened command in the user\'s own box, cleared environment, last message and usage; outsiders invisible', BOX, async () => {
@@ -145,6 +152,17 @@ test('run: each harness\'s hardened command in the user\'s own box, cleared envi
       if (id === 'grok') { assert.deepEqual(s.homeFiles, ['.grok', '.grok/auth.json', '.grok/config.toml']); assert.ok(s.env.includes('GROK_DISABLE_AUTOUPDATER')); }
     }
     await assert.rejects(w.hb.run('alice', 'grok', { prompt: '--help', dir: w.job() }), /not starting with "-"/);
+    await assert.rejects(w.hb.run('alice', 'grok', { prompt: 'a\0b', dir: w.job() }), /not starting with "-"/);
+    // lines that are JSON but no event, and usage that is no number, neither end the runner nor poison the count
+    let r;
+    for (const id of IDS) {
+      r = await w.hb.run('alice', id, { prompt: 'FAKE_MODE=junk', dir: w.job(), onEvent: () => { throw new Error('a caller bug'); } });
+      assert.deepEqual([r.code, r.text, r.usage], [0, 'done (junk)', expect[id]], id);
+    }
+    const ac = new AbortController();
+    ac.abort();
+    r = await w.hb.run('alice', 'codex', { prompt: 'x', dir: w.job(), signal: ac.signal });
+    assert.deepEqual([r.canceled, r.code], [true, -1], 'aborted before it started: no box');
   } finally { w.close(); }
 });
 

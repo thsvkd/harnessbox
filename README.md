@@ -36,8 +36,8 @@ const r = await hb.run('u_alice', 'claude-code', {
   args: ['--allowedTools', `Read(/${jobDir}/**)`, `Edit(/${jobDir}/out/**)`], // the caller's tool rules
 });
 // r: { code, text, usage: { input, output[, unknown] }, error, stderr, why, timedOut, canceled, loggedIn? }
-const draft = await readOut(jobDir, 'out/summary.md'); // never readFile on what a box wrote
-await hb.exec('u_alice', 'claude-code', ['python3', '-I', '/opt/v/validate.py', `${jobDir}/out/x.json`], { dir: jobDir }); // no network
+const draft = await readOut(jobDir, 'out/summary.md'); // never readFile on what a box wrote; jobDir must be a real path
+await hb.exec('u_alice', 'claude-code', ['python3', '-I', '/opt/v/validate.py', `${jobDir}/out/x.json`], { dir: jobDir, roBinds: ['/opt/v'] }); // no network
 await hb.logout('u_alice', 'grok');
 await hb.purge('u_alice');                  // every harness home of the user, after their running job
 process.on('SIGTERM', () => { hb.close(); process.exit(143); });
@@ -125,7 +125,10 @@ The boundaries, honestly:
   processes (128); a CLI's own memory is only bounded by the container's `mem_limit`, and only if the kernel's memory cgroup is on
   (the Raspberry Pi kernel ships with `cgroup_disable=memory`). One user can exhaust memory for all.
 - **A user's own credential is readable in their own box** (the CLI must read it). The host allowlist is the only limit on where it
-  can go. A box can also overwrite its own kept credential file, which then persists (it can only hurt its own login).
+  can go. A box can also overwrite its own kept credential file, which then persists: a job could swap in another account's
+  credential, and the user's later jobs would run (and send their material) under that account.
+- **The CLI is not a boundary inside its box.** The model's commands run as the same uid in the same pid namespace and, without Yama,
+  can ptrace the CLI: read its memory, write its stdout. The runner treats everything a box prints or writes as hostile input.
 - **The runner process sees everything**: it owns all homes. Anything it reads from a job folder goes through `readOut` (no links, no
   FIFOs, real path checked), and validators run in a box. Keep the runner script small.
 - **DNS** is resolved by the runner, not the box; the proxy refuses private, loopback, CGNAT, link-local and multicast results and

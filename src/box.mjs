@@ -4,7 +4,7 @@ import dns from 'node:dns';
 import { constants } from 'node:fs';
 import { chmod, lstat, open, readdir, readFile, readlink, rm } from 'node:fs/promises';
 import net from 'node:net';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 /** User and harness ids: they become folder names under the homes root. */
 export const ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -103,9 +103,11 @@ async function keepKeys(file, size, keys) {
 
 /**
  * <realDir>/<name> or null: a regular file of at most max bytes whose real path is exactly that (no symlinked file or folder on the
- * way, no FIFO). A box wrote it; the runner reading it can see every user's home.
+ * way, no FIFO). A box wrote it; the runner reading it can see every user's home. realDir must be a real path (realpath() it once):
+ * otherwise every read is null.
  */
 export async function readOut(realDir, name, max = 2 * 1024 * 1024) {
+  if (isAbsolute(name) || name.split('/').includes('..')) return null;
   const want = join(realDir, name);
   let fh;
   try {

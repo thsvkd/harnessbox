@@ -97,7 +97,11 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
     // the kernel's per-box cap counts threads too (a CLI has a few dozen): the watchdog counts processes against maxProcs
     const args = boxArgs({ home, dir, net, sock, socat: SOCAT, path: PATH_IN_BOX, env: { ...passEnv, ...a.env, ...env }, roBinds: [...RO, ...roBinds], chdir: dir ?? home,
       cmd, maxTasks: maxProcs * 4, nested, seccomp: !!filter });
-    const child = spawn(bwrap, args, { stdio: [stdin, 'pipe', 'pipe', ...(filter ? ['pipe'] : [])], env: { PATH: process.env.PATH } });
+    let child;
+    try { child = spawn(bwrap, args, { stdio: [stdin, 'pipe', 'pipe', ...(filter ? ['pipe'] : [])], env: { PATH: process.env.PATH } }); } catch (e) {
+      if (proxy) { proxy.close(); await rm(sock, { force: true }); } // an argument spawn refuses (a NUL byte, say) leaves nothing open
+      throw e;
+    }
     if (filter) child.stdio[3].on('error', () => {}).end(filter);
     // Stopping a box is SIGKILL to bwrap: --die-with-parent takes everything in it (it is a session of its own, so a group kill would not).
     const b = { child, home, dir, why: null, kill: () => { try { child.kill('SIGKILL'); } catch { /* gone */ } } };
@@ -208,8 +212,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   async function purge(userId) {
     user(userId);
     for (const [k, s] of logins) if (k.startsWith(`${userId}/`)) s.cancel();
-    const releases = [];
-    for (const a of adapters) releases.push(await lock(key(userId, a)));
+    const releases = await Promise.all(adapters.map((a) => lock(key(userId, a))));
     try { await rm(join(homes, userId), { recursive: true, force: true }); } finally { releases.forEach((r) => r()); }
   }
 
@@ -218,7 +221,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   // is logged.
   const logins = new Map(); // key -> session
   /**
-   * @returns {{ state: 'starting'|'waiting'|'done'|'failed', url: string|null, code: string|null, needsCode: boolean, error?: string,
+   * @returns {{ state: 'starting'|'waiting'|'refused'|'done'|'failed', url: string|null, code: string|null, needsCode: boolean, error?: string,
    *   waiting: Promise<{url: string, code: string|null, needsCode: boolean}>, done: Promise<{ok: boolean, status?: object, error?: string}>,
    *   submitCode(code: string): boolean, cancel(): void }}
    */
@@ -240,7 +243,8 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
     s.waiting.catch(() => {}); // a login that fails before its URL: the reason is in done
     const end = (r) => {
       s.state = r.ok ? 'done' : 'failed';
-      if (!r.ok) { s.error = r.error; settle.no(new Error(r.error)); }
+      if (!r.ok) s.error = r.error;
+      settle.no(new Error(r.error ?? 'the login ended without a URL')); // a no-op once waiting resolved
       return r;
     };
     logins.set(k, s);
@@ -255,11 +259,12 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
         const read = (d) => {
           if (s.state !== 'starting') return; // all that is needed went: the rest is dropped
           seen = (seen + d).replace(ANSI, '').slice(-4096);
-          const got = a.login.parse(seen);
+          let got = null;
+          try { got = a.login.parse(seen); } catch { /* the CLI's output never ends the runner */ }
           if (!got) return;
           const u = URL.parse(got.url);
           if (u?.protocol !== 'https:' || !a.login.urlHosts.includes(u.hostname)) { s.state = 'refused'; b.kill(); return; }
-          Object.assign(s, { state: 'waiting', url: got.url, code: got.code ?? null });
+          Object.assign(s, { state: 'waiting', url: u.href, code: typeof got.code === 'string' ? got.code : null });
           seen = '';
           settle.ok({ url: s.url, code: s.code, needsCode: s.needsCode });
         };
@@ -297,12 +302,15 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
    */
   async function run(userId, id, { prompt, dir, timeoutMs = 40 * 60e3, args = [], env = {}, roBinds = [], signal, onEvent } = {}) {
     const a = usable(id), k = key(user(userId), a);
-    if (typeof prompt !== 'string' || !prompt || prompt.startsWith('-')) throw new Error('prompt must be a non-empty string not starting with "-"');
+    if (typeof prompt !== 'string' || !prompt || prompt.startsWith('-') || prompt.includes('\0')) throw new Error('prompt must be a non-empty string not starting with "-"');
     dir = await realpath(dir); // the adapter's paths and readOut compare against the real path
-    await slot();
-    let release = null;
+    // the user's lock first: one user's queued jobs wait on their own lock, not in job slots other users need
+    const release = await lock(k);
+    let slotted = false;
     try {
-      release = await lock(k);
+      await slot();
+      slotted = true;
+      if (signal?.aborted) return { code: -1, text: '', usage: { input: 0, output: 0, unknown: true }, error: '', stderr: '', why: null, timedOut: false, canceled: true };
       const tmp = join(dir, '.tmp');
       await mkdir(tmp, { recursive: true });
       const c = a.job.command({ prompt, dir, has: detected.get(id).has, extra: args });
@@ -312,7 +320,12 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
       const acc = { text: '', usage: { input: 0, output: 0 }, reports: 0, error: '', stage: '' };
       let out = '', err = '', timedOut = false, canceled = false;
       // one JSON event a line; a line that does not parse (cut off by a stop, say) is skipped
-      const line = (l) => { let e; try { e = JSON.parse(l); } catch { return; } a.job.event(e, acc); onEvent?.(e); };
+      const line = (l) => {
+        let e;
+        try { e = JSON.parse(l); } catch { return; }
+        if (!e || typeof e !== 'object') return;
+        try { a.job.event(e, acc); onEvent?.(e); } catch { /* a hostile line or a throwing handler never ends the runner (and every box) */ }
+      };
       b.child.stdout.on('data', (d) => { const lines = (out + d).split('\n'); out = lines.pop().slice(-1e6); lines.forEach(line); });
       b.child.stderr.on('data', (d) => { err = (err + d).slice(-4000); });
       const abort = () => { canceled = true; b.kill(); };
@@ -328,8 +341,9 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
       if (!b.why && !timedOut && !canceled && code !== 0) r.loggedIn = a.expired?.test(`${acc.error} ${err}`) ? false : (await statusIn(userId, a).catch(() => null))?.loggedIn;
       return r;
     } finally {
-      if (release) { await scrubHome(homeOf(userId, a), a.keep, a.keepJsonKeys).catch(() => {}); release(); }
-      free();
+      await scrubHome(homeOf(userId, a), a.keep, a.keepJsonKeys).catch(() => {});
+      if (slotted) free();
+      release();
     }
   }
 
