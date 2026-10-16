@@ -1,0 +1,28 @@
+name: Check
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install sandbox tools and require working user namespaces
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap socat python3
+          # This is an ephemeral test runner. Permit the nested user namespace used by the Codex adapter tests.
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --symlink usr/lib /lib --proc /proc --dev /dev /usr/bin/true
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check

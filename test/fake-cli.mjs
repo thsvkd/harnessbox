@@ -13,7 +13,8 @@
 // example.com:443 through the box's proxy), symlink (codex: the last-message file is a link to FAKE_TARGET), junk (JSON lines that
 // are not objects and a result with non-numeric usage before the usual events). FAKE_LOGIN_NOURL: `claude auth login` exits 0 at once.
 import { spawn, spawnSync } from 'node:child_process';
-import { accessSync, existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { once } from 'node:events';
 import net from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -47,6 +48,10 @@ export async function main(kind) {
 
   if (kind === 'claude' && args[0] === 'auth') {
     if (args[1] === 'status') {
+      if (process.env.FAKE_STATUS_MARKER && loggedIn()) {
+        writeFileSync(process.env.FAKE_STATUS_MARKER, 'verifying');
+        await sleep(2000);
+      }
       console.log(JSON.stringify(loggedIn() ? { loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max' } : { loggedIn: false, authMethod: 'none' }, null, 2));
       return process.exit(loggedIn() ? 0 : 1);
     }
@@ -95,7 +100,7 @@ export async function main(kind) {
   const seen = (p) => { try { accessSync(p); return true; } catch { return false; } };
   const saw = { kind, args, prompt, cwd: process.cwd(), env: Object.keys(process.env).sort(), tmp: process.env.TMPDIR, home: homedir(), homeFiles: readdirSync(homedir(), { recursive: true }).sort(), users: readdirSync(join(homedir(), '..', '..')), harnesses: readdirSync(join(homedir(), '..')),
     loggedIn: loggedIn(), userns: spawnSync('unshare', ['-Ur', 'true']).status === 0, peek: Object.fromEntries((process.env.FAKE_PEEK ?? '').split(',').filter(Boolean).map((p) => [p, seen(p)])) };
-  if (mode === 'egress') saw.egress = { denied: await connect('example.com'), allowed: await connect('api.anthropic.com') };
+  if (mode === 'egress') saw.egress = { denied: await connect('example.com') }; // allowed tunneling is covered with a local upstream in box.test.mjs
   writeFileSync(join(dir, 'seen.json'), JSON.stringify(saw));
   const hang = () => { process.on('SIGTERM', () => process.exit(143)); setInterval(() => {}, 1000); };
   if (kind === 'claude') console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 's1', model: 'claude-sonnet-5-5' }));
@@ -108,6 +113,37 @@ export async function main(kind) {
   if (mode === 'expired') { console.log(JSON.stringify({ type: 'result', is_error: true, result: 'Login expired · Please run /login', usage: { input_tokens: 0, output_tokens: 0 } })); return process.exit(1); }
   if (mode === 'fail') { console.error('fake failure'); return process.exit(3); }
   if (mode === 'hang') return hang();
+  if (mode === 'burst-exit') {
+    await sleep(20);
+    process.stdout.write('x'.repeat(8192));
+    return process.exit(0);
+  }
+  if (mode === 'hidden-disk') {
+    const hidden = join(dir, 'hidden');
+    mkdirSync(hidden);
+    writeFileSync(join(hidden, 'payload'), Buffer.alloc(2 * 1024 * 1024));
+    chmodSync(hidden, 0);
+    await sleep(3500);
+    chmodSync(hidden, 0o700);
+  }
+  if (mode === 'stderr-flood') {
+    for (let i = 0; i < 64; i++) if (!process.stderr.write('x'.repeat(32768))) await once(process.stderr, 'drain');
+    return;
+  }
+  if (mode === 'flood') {
+    const line = `${JSON.stringify({ type: 'text', data: 'x'.repeat(32768) })}\n`;
+    for (let i = 0; i < 64; i++) if (!process.stdout.write(line)) await once(process.stdout, 'drain');
+    return;
+  }
+  if (mode === 'unicode') {
+    const text = Buffer.from('한글🙂');
+    process.stdout.write(Buffer.concat([Buffer.from('{"type":"result","result":"'), text.subarray(0, 1)]));
+    await sleep(80);
+    process.stdout.write(text.subarray(1, 7));
+    await sleep(80);
+    process.stdout.write(Buffer.concat([text.subarray(7), Buffer.from('","usage":{"input_tokens":1,"output_tokens":1}}\n')]));
+    return;
+  }
   if (mode === 'forkbomb') {
     // a spawn past the box's RLIMIT_NPROC fails (EAGAIN): no pid
     for (let i = 0; i < Number(process.env.FAKE_PROCS ?? 200); i++) spawn('sleep', ['300'], { stdio: 'ignore' }).on('error', () => {});

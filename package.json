@@ -1,11 +1,18 @@
 {
   "name": "harnessbox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Per-user bubblewrap boxes for agent CLIs (Claude Code, Codex, Grok): each user's own login, an egress allowlist, no credential in the host app",
   "type": "module",
-  "exports": "./src/index.mjs",
+  "types": "./src/index.d.ts",
+  "exports": {
+    "types": "./src/index.d.ts",
+    "default": "./src/index.mjs"
+  },
   "files": [
-    "src"
+    "src",
+    "deploy",
+    "docs",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=24"
@@ -13,9 +20,23 @@
   "os": [
     "linux"
   ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thsvkd/harnessbox.git"
+  },
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "npm run typecheck && npm test",
     "probe": "node deploy/probe.mjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "6.0.3"
+  }
 }

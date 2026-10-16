@@ -119,7 +119,7 @@ echo "fetch_allowed: $(${online ? `f https://${a.hosts[0]}/ 1` : 'echo skipped'}
 } catch (e) {
   check('probe ran to the end', false, e.stack);
 } finally {
-  hb.close();
+  await hb.close();
   await rm(join(homes, A), { recursive: true, force: true });
   await rm(join(homes, B), { recursive: true, force: true });
   if (!env.HB_HOMES) await rm(homes, { recursive: true, force: true });

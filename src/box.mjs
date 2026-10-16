@@ -2,7 +2,7 @@
 // the watchdog's /proc and disk counts. Pure helpers, no side effects on import; runner.mjs wires them up.
 import dns from 'node:dns';
 import { constants } from 'node:fs';
-import { chmod, lstat, open, readdir, readFile, readlink, rm } from 'node:fs/promises';
+import { chmod, lstat, open, opendir, readdir, readFile, readlink, rm } from 'node:fs/promises';
 import net from 'node:net';
 import { isAbsolute, join } from 'node:path';
 
@@ -143,22 +143,23 @@ export async function countDescendants(rootPids, procDir = '/proc') {
   return counts;
 }
 
-/** Bytes and entries under the given folders (lstat, links not followed), stopping once entries pass cap. Bytes are the larger of
- *  size and allocated blocks: fallocate --keep-size takes disk (or tmpfs memory) with size 0, truncate gives size without blocks. */
+/** Bytes and entries under the given folders, stopping once entries pass cap. Directory entries are streamed, not loaded all at
+ * once. Only vanished paths are ignored: unreadable files or directories must stop the box, not hide its disk usage.
+ * Bytes are the larger of size and allocated blocks (including fallocate --keep-size). */
 export async function diskUse(roots, cap = 20000) {
   let bytes = 0, entries = 0;
   const todo = [...roots];
   while (todo.length && entries <= cap) {
     const dir = todo.pop();
-    let names;
-    try { names = await readdir(dir); } catch { continue; }
-    for (const n of names) {
+    let directory;
+    try { directory = await opendir(dir); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+    for await (const entry of directory) {
       if (++entries > cap) break;
       try {
-        const s = await lstat(join(dir, n));
+        const path = join(dir, entry.name), s = await lstat(path);
         bytes += Math.max(s.size, s.blocks * 512);
-        if (s.isDirectory()) todo.push(join(dir, n));
-      } catch { /* gone meanwhile */ }
+        if (s.isDirectory()) todo.push(path);
+      } catch (e) { if (e.code !== 'ENOENT') throw e; }
     }
   }
   return { bytes, entries };

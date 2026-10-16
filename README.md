@@ -6,7 +6,10 @@ home; the app only relays the login URL and a code. A box sees only its user's h
 the internet only through a CONNECT proxy that allows the harness's own hosts on port 443.
 
 Extracted on 2026-10-16 from review-automation's per-user runner (`app/runner/box.mjs`, `rva-runner.mjs`), deployed there for
-Claude Code and Codex. Node 24, Linux, bubblewrap, socat; no npm dependencies. Version 0.1.0, not published.
+Claude Code and Codex. Node 24, Linux (arm64 or x64), bubblewrap, socat; no runtime npm dependencies. Version 0.1.1.
+Install the package tarball from this repository's release, or use a Git dependency. TypeScript declarations and the deployment
+probe are included. The package is not published to the public npm registry.
+TypeScript consumers need `@types/node` in their development dependencies.
 
 ```
 host app ── its own API ── runner process (your script, uid 10011, one hardened container)
@@ -40,12 +43,12 @@ const draft = await readOut(jobDir, 'out/summary.md'); // never readFile on what
 await hb.exec('u_alice', 'claude-code', ['python3', '-I', '/opt/v/validate.py', `${jobDir}/out/x.json`], { dir: jobDir, roBinds: ['/opt/v'] }); // no network
 await hb.logout('u_alice', 'grok');
 await hb.purge('u_alice');                  // every harness home of the user, after their running job
-process.on('SIGTERM', () => { hb.close(); process.exit(143); });
+process.once('SIGTERM', async () => { await hb.close(); process.exit(143); });
 ```
 
 | `createRunner` option | Default | |
 |---|---|---|
-| `homes` | (required) | Root of the per-user homes, one uid owns them all. `<homes>/<userId>/<harnessId>`, 0700. User and harness ids: `[A-Za-z0-9_-]{1,64}`. |
+| `homes` | (required) | Absolute root of the per-user homes, one uid owns them all. `<homes>/<userId>/<harnessId>`, 0700. User and harness ids: `[A-Za-z0-9_-]{1,64}`. |
 | `adapters` | (required) | `claudeCode`, `codex`, `grok`, or your own (docs/adapters.md). |
 | `bins`, `pins` | PATH, none | Binary and exact version per harness id. Another version is not usable. |
 | `bwrap`, `socat` | on PATH | |
@@ -53,12 +56,27 @@ process.on('SIGTERM', () => { hb.close(); process.exit(143); });
 | `maxQuick` | 2 | Status and logout boxes at once; more throw `Busy`. A status waits at most `waitMs` (5 s) for the user's lock. |
 | `maxProcs` | 128 | Per box, watchdog (2 s). The in-box RLIMIT_NPROC is 4x (threads count). |
 | `maxBytes`, `maxEntries` | 1 GiB, 20000 | Home + job folder per box, watchdog. |
+| `maxOutputBytes` | 8 MiB | Cumulative stdout + stderr per job. Stops a box before more output reaches its event parser or text accumulator. |
 | `log` | none | Egress denials (`egress deny <label> <host>:<port> <why>`) and watchdog notes. Never URLs, codes or credentials. |
 | `passEnv` | `{}` | Extra variables in every box (tests). |
 
 One lock per user and harness: a login, status, logout and job of the same credential never overlap (both Claude Code and Codex
 rotate refresh tokens; two refreshes at once log the user out). The home is scrubbed to the adapter's credential files before every
 box and after every job, so a box cannot plant hooks, shell start-up files or MCP servers for the next one.
+
+One runner process must exclusively own a `homes` root. Locks and concurrency counters are in memory; they do not coordinate
+multiple processes or replicas. Give replicas separate roots and stable user routing, or add coordination in the host app.
+Resource limits must be positive safe integers. Missing bubblewrap/socat and unsupported seccomp architectures fail startup.
+Concurrent `detect()` calls are serialized so their temporary probe homes cannot interfere.
+
+`run(..., { signal })` can be canceled while waiting for either the user's lock or a job slot, returning `canceled: true` without
+launching a box. `timeoutMs` measures execution after the box starts, not queue time. `onEvent` accepts synchronous or async
+notifications; neither a thrown error nor a rejected promise ends the runner. Notifications are not awaited for delivery.
+Output is decoded across UTF-8 byte boundaries. Exceeding `maxOutputBytes` sets `why` and kills the box; it does not return a
+successful truncated answer.
+
+`close()` immediately stops accepting work and kills boxes, and returns a promise for in-flight cleanup. Await it before removing
+runner data or exiting. Queued jobs settle as canceled; other pending operations can reject. Repeated `close()` calls are safe.
 
 ## Adapters
 
@@ -125,6 +143,9 @@ The boundaries, honestly:
 - **Memory is not limited per box.** /tmp and /run in a box are 256 MiB tmpfs, the watchdog caps the home and job folder (1 GiB) and
   processes (128); a CLI's own memory is only bounded by the container's `mem_limit`, and only if the kernel's memory cgroup is on
   (the Raspberry Pi kernel ships with `cgroup_disable=memory`). One user can exhaust memory for all.
+- **Storage checks are not filesystem quotas.** The watchdog runs every 2 s, so a box can overshoot between checks. An unreadable
+  directory or another inspection error stops the box instead of hiding usage. Use filesystem quotas when storage needs a hard
+  per-user limit. The host app owns job-folder cleanup, including restoring directory permissions after a hostile job.
 - **A user's own credential is readable in their own box** (the CLI must read it). The host allowlist is the only limit on where it
   can go. A box can also overwrite its own kept credential file, which then persists: a job could swap in another account's
   credential, and the user's later jobs would run (and send their material) under that account.
@@ -186,9 +207,12 @@ Before deploying, check on the host: `cat /proc/sys/user/max_user_namespaces` (>
 
 ## Tests
 
-`npm test`: box primitives (proxy with stubbed DNS and upstream, scrub, reader, counts, argv, seccomp filter in a real box) and the
+`npm ci && npm run check`: public TypeScript API checks, box primitives (proxy with stubbed DNS and upstream, scrub, reader, counts, argv, seccomp filter in a real box) and the
 runner end to end with real bubblewrap boxes and fake CLIs (`test/fake-cli.mjs`). Tests that need bubblewrap with user namespaces
-skip themselves without it. `node deploy/probe.mjs` with the real CLIs is the smoke test.
+skip themselves without it; CI requires working namespaces before running the suite. Regressions cover unreadable disk usage,
+cumulative output limits, UTF-8 fragmentation, async event failures, queued cancellation and shutdown. A separate test installs
+the packed tarball in a fresh project and invokes its shipped probe without a real account. `node deploy/probe.mjs` with the real
+CLIs is the smoke test; a fake-CLI test is not evidence of an authenticated login or inference.
 
 ## How review-automation would use it
 

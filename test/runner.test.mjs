@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Busy, claudeCode, codex, createRunner, grok } from '../src/index.mjs';
@@ -16,6 +16,10 @@ const BOX = { skip: !canBox && 'needs bubblewrap with user namespaces' };
 const CRED = { 'claude-code': '.claude/.credentials.json', codex: '.codex/auth.json', grok: '.grok/auth.json' };
 const IDS = Object.keys(CRED);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function started(dir) {
+  for (let i = 0; i < 100; i++) { if (existsSync(join(dir, 'seen.json'))) return; await sleep(30); }
+  throw new Error('the fake CLI did not start');
+}
 process.env.ANTHROPIC_API_KEY = 'sk-ant-must-not-reach'; // the runner's environment never gets into a box
 process.env.XAI_API_KEY = 'xai-must-not-reach';
 
@@ -51,6 +55,232 @@ test('detect: version, help options and the harness\'s own checks in a box; a pi
     assert.equal(row.usable, false);
     assert.match(row.why, /sandbox does not start/);
   } finally { w.close(); }
+});
+
+test('watchdog stops a box that hides disk usage behind unreadable directory permissions', BOX, async () => {
+  const w = await world({ maxBytes: 128 * 1024 });
+  const dir = w.job();
+  try {
+    await w.hb.detect();
+    w.logIn('alice', 'claude-code');
+    const r = await w.hb.run('alice', 'claude-code', { prompt: 'FAKE_MODE=hidden-disk', dir });
+    assert.notEqual(r.code, 0);
+    assert.match(r.why, /inspect|EACCES|disk/i);
+  } finally {
+    if (existsSync(join(dir, 'hidden'))) chmodSync(join(dir, 'hidden'), 0o700);
+    await w.close();
+  }
+});
+
+test('concurrent detect calls serialize access to the shared probe homes', BOX, async () => {
+  const w = await world();
+  let peak = 0;
+  const polling = setInterval(() => { peak = Math.max(peak, w.hb.boxes.size); }, 2);
+  try {
+    const results = await Promise.allSettled([w.hb.detect(), w.hb.detect()]);
+    assert.ok(peak <= 1, `overlapping probe boxes: ${peak}`);
+    for (const result of results) {
+      assert.equal(result.status, 'fulfilled', result.reason?.message);
+      assert.ok(result.value.every((r) => r.usable));
+    }
+  } finally { clearInterval(polling); await w.close(); }
+});
+
+test('run stops cumulative stdout at maxOutputBytes before retaining unlimited Grok text', BOX, async () => {
+  const w = await world({ maxOutputBytes: 128 * 1024 });
+  try {
+    await w.hb.detect();
+    w.logIn('alice', 'grok');
+    const r = await w.hb.run('alice', 'grok', { prompt: 'FAKE_MODE=flood', dir: w.job() });
+    assert.notEqual(r.code, 0);
+    assert.match(r.why, /output/i);
+    assert.ok(Buffer.byteLength(r.text) <= 128 * 1024);
+  } finally { await w.close(); }
+});
+
+test('run applies the output budget to stderr as well as stdout', BOX, async () => {
+  const w = await world({ maxOutputBytes: 128 * 1024 });
+  try {
+    await w.hb.detect();
+    w.logIn('alice', 'claude-code');
+    const r = await w.hb.run('alice', 'claude-code', { prompt: 'FAKE_MODE=stderr-flood', dir: w.job() });
+    assert.notEqual(r.code, 0);
+    assert.match(r.why, /output/i);
+    assert.ok(r.stderr.length <= 4000);
+  } finally { await w.close(); }
+});
+
+test('an output-limit violation cannot report success after a fast child has already exited', BOX, async () => {
+  const w = await world({ maxOutputBytes: 1024 });
+  try {
+    await w.hb.detect();
+    w.logIn('alice', 'claude-code');
+    const r = await w.hb.run('alice', 'claude-code', {
+      prompt: 'FAKE_MODE=burst-exit', dir: w.job(),
+      onEvent: () => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300); },
+    });
+    assert.match(r.why, /output/i);
+    assert.notEqual(r.code, 0);
+  } finally { await w.close(); }
+});
+
+test('login cancel also stops its follow-up authentication-status box', BOX, async () => {
+  const marker = '.claude/status-verification';
+  const w = await world({ env: { FAKE_STATUS_MARKER: marker } });
+  let session;
+  try {
+    await w.hb.detect();
+    session = w.hb.login('alice', 'claude-code');
+    await session.waiting;
+    session.submitCode('good-code');
+    const path = join(w.home('alice', 'claude-code'), marker);
+    for (let i = 0; i < 100 && !existsSync(path); i++) await sleep(30);
+    assert.ok(existsSync(path), 'the follow-up status box started');
+    session.cancel();
+    const r = await Promise.race([session.done, sleep(500).then(() => null)]);
+    assert.deepEqual(r, { ok: false, error: 'canceled' });
+    assert.equal(w.hb.boxes.size, 0);
+  } finally { w.hb.close(); await session?.done; await w.close(); }
+});
+
+test('run abort also stops authentication-status verification after a failed CLI', BOX, async () => {
+  const marker = '.claude/status-verification';
+  const w = await world({ env: { FAKE_STATUS_MARKER: marker } });
+  let pending;
+  try {
+    await w.hb.detect();
+    w.logIn('alice', 'claude-code');
+    const ac = new AbortController();
+    pending = w.hb.run('alice', 'claude-code', { prompt: 'FAKE_MODE=fail', dir: w.job(), signal: ac.signal });
+    const path = join(w.home('alice', 'claude-code'), marker);
+    for (let i = 0; i < 100 && !existsSync(path); i++) await sleep(30);
+    assert.ok(existsSync(path), 'the failed run is verifying its login');
+    ac.abort();
+    const r = await Promise.race([pending, sleep(500).then(() => null)]);
+    assert.equal(r?.canceled, true);
+    assert.equal(r.code, -1);
+    assert.equal(r.loggedIn, undefined, 'a canceled check must not misreport logout');
+    assert.equal(w.hb.boxes.size, 0);
+  } finally { w.hb.close(); await pending; await w.close(); }
+});
+
+test('run decodes Korean and emoji across stdout byte boundaries', BOX, async () => {
+  const w = await world();
+  try {
+    await w.hb.detect();
+    w.logIn('alice', 'claude-code');
+    const r = await w.hb.run('alice', 'claude-code', { prompt: 'FAKE_MODE=unicode', dir: w.job() });
+    assert.equal(r.text, '한글🙂');
+  } finally { await w.close(); }
+});
+
+test('run aborts promptly while waiting for either a user lock or a global job slot', BOX, async () => {
+  for (const queuedUser of ['alice', 'bob']) {
+    const w = await world({ maxJobs: 1 });
+    let first, queued;
+    try {
+      await w.hb.detect();
+      w.logIn('alice', 'claude-code');
+      const d1 = w.job(), d2 = w.job(), ac = new AbortController();
+      first = w.hb.run('alice', 'claude-code', { prompt: 'FAKE_MODE=hang', dir: d1, timeoutMs: 5000 });
+      await started(d1);
+      queued = w.hb.run(queuedUser, 'claude-code', { prompt: 'x', dir: d2, signal: ac.signal });
+      await sleep(50);
+      ac.abort();
+      const r = await Promise.race([queued, sleep(500).then(() => null)]);
+      assert.equal(r?.canceled, true, `queued behind ${queuedUser === 'alice' ? 'lock' : 'slot'}`);
+      assert.ok(!existsSync(join(d2, 'seen.json')));
+      assert.equal(w.hb.boxes.size, 1, 'cancel did not stop the running job');
+    } finally {
+      w.hb.close();
+      await Promise.allSettled([first, queued]);
+      await w.close();
+    }
+  }
+});
+
+test('close settles active and queued jobs without launching any more boxes', BOX, async () => {
+  const w = await world({ maxJobs: 1 });
+  let first, queued;
+  try {
+    await w.hb.detect();
+    for (const u of ['alice', 'bob']) w.logIn(u, 'claude-code');
+    const d1 = w.job(), d2 = w.job();
+    first = w.hb.run('alice', 'claude-code', { prompt: 'FAKE_MODE=hang', dir: d1 });
+    await started(d1);
+    queued = w.hb.run('bob', 'claude-code', { prompt: 'x', dir: d2 });
+    await sleep(50);
+    await w.hb.close();
+    assert.equal((await first).canceled, true);
+    assert.equal((await queued).canceled, true);
+    assert.ok(!existsSync(join(d2, 'seen.json')));
+    assert.equal(w.hb.boxes.size, 0);
+    await assert.rejects(w.hb.run('bob', 'claude-code', { prompt: 'x', dir: w.job() }), /closed/);
+    await assert.rejects(w.hb.exec('bob', 'claude-code', ['true']), /closed/);
+    assert.throws(() => w.hb.login('bob', 'claude-code'), /closed/);
+  } finally {
+    w.hb.close();
+    await Promise.allSettled([first, queued]);
+    await w.close();
+  }
+});
+
+test('close waits for in-flight preparation and prevents a box from starting after shutdown', BOX, async () => {
+  const w = await world();
+  let pending;
+  try {
+    await w.hb.detect();
+    const dir = w.job();
+    pending = w.hb.run('alice', 'claude-code', { prompt: 'x', dir });
+    await w.hb.close();
+    assert.equal((await pending).canceled, true);
+    assert.ok(!existsSync(join(dir, 'seen.json')));
+    assert.equal(w.hb.boxes.size, 0);
+  } finally { w.hb.close(); await Promise.allSettled([pending]); await w.close(); }
+});
+
+test('runner refuses startup when its seccomp architecture is unsupported', async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'arch');
+  const root = mkdtempSync(join(tmpdir(), 'hb-arch-test-'));
+  let hb;
+  try {
+    Object.defineProperty(process, 'arch', { value: 'unsupported' });
+    await assert.rejects(async () => { hb = await createRunner({ homes: root, adapters: [] }); }, /seccomp/);
+  } finally { Object.defineProperty(process, 'arch', descriptor); await hb?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('runner rejects invalid resource limits and duplicate adapter identities at startup', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-options-test-'));
+  try {
+    for (const bad of [{ maxJobs: 0 }, { maxJobs: 1.5 }, { maxQuick: -1 }, { maxProcs: Infinity }, { maxBytes: NaN },
+      { maxEntries: 0 }, { maxOutputBytes: 0 }, { maxOutputBytes: NaN }, { adapters: [claudeCode, claudeCode] }]) {
+      let hb;
+      try {
+        await assert.rejects(async () => { hb = await createRunner({ homes: root, adapters: [claudeCode], bins: FAKE, socat: join(HERE, 'fake-socat'), ...bad }); }, /positive|integer|duplicate/i);
+      } finally { await hb?.close(); }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('runner detects a missing bubblewrap or socat before accepting any work', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-tools-test-'));
+  try {
+    for (const bad of [{ bwrap: '/nonexistent/hb-bwrap' }, { socat: '/nonexistent/hb-socat' }]) {
+      let hb;
+      try {
+        await assert.rejects(async () => { hb = await createRunner({ homes: root, adapters: [], socat: join(HERE, 'fake-socat'), ...bad }); }, /not found/);
+      } finally { await hb?.close(); }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('async event-handler rejection does not terminate the runner process', BOX, () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-event-test-'));
+  try {
+    const child = spawnSync(process.execPath, [join(HERE, 'async-event-check.mjs'), root], { encoding: 'utf8', timeout: 15000, env: { ...process.env, TMPDIR: root } });
+    assert.equal(child.status, 0, child.stderr);
+    assert.match(child.stdout, /event handler survived/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('login: paste code (Claude Code), device code (Codex, Grok on stderr with ANSI) into each user\'s own harness home; status and logout', BOX, async () => {
