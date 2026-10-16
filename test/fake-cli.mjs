@@ -35,7 +35,7 @@ export async function main(kind) {
   if (args[0] === '--version') return console.log(VERSION[kind]);
   if (kind === 'claude' && args[0] === '--help') return console.log(`-p, --print --output-format (choices: "text", "json", "stream-json") --verbose --permission-mode (choices: "dontAsk") --tools --allowedTools --disallowedTools --strict-mcp-config${process.env.FAKE_HELP === 'old' ? '' : ' --restricted'} --no-session-persistence --max-turns`);
   if (kind === 'codex' && args[0] === 'exec' && args[1] === '--help') return console.log('--skip-git-repo-check -s, --sandbox --ephemeral --ignore-user-config --ignore-rules --json -o, --output-last-message --enable --disable');
-  if (kind === 'grok' && args[0] === '--help') return console.log('-p, --single <PROMPT> --output-format <plain|json|streaming-json> --cwd --permission-mode --disallowed-tools --disable-web-search --no-auto-update --max-turns');
+  if (kind === 'grok' && args[0] === '--help') return console.log('-p, --single <PROMPT> --output-format <plain|json|streaming-json> --cwd --permission-mode --disallowed-tools --disable-web-search --max-turns');
   const creds = join(homedir(), CRED[kind]), loggedIn = () => existsSync(creds);
   const logIn = () => { mkdirSync(dirname(creds), { recursive: true }); writeFileSync(creds, '{"fake":true}'); };
   const device = async (url, code, out) => {

@@ -133,7 +133,7 @@ telemetry = false
  * Grok (the official xAI CLI, `curl -fsSL https://x.ai/cli/install.sh | bash -s <version>`). Credentials in ~/.grok/auth.json, no
  * keyring. Login: `grok login --device-auth` prints (on stderr) an accounts.x.ai URL and a one-time code, then polls auth.x.ai until
  * the user confirms. No status command: `grok models` says "You are not authenticated." when there is no login. Job: headless
- * `-p`, streaming-json; web tools removed; its own sandbox stays off (no nested user namespace).
+ * `-p`, streaming-json; web search and fetch off; its own sandbox stays off (no nested user namespace).
  * @type {Adapter}
  */
 export const grok = {
@@ -142,14 +142,13 @@ export const grok = {
   keep: ['.grok/auth.json'],
   seed: { '.grok/config.toml': GROK_CONFIG },
   env: { GROK_DISABLE_AUTOUPDATER: '1', GROK_TELEMETRY_ENABLED: '0', DISABLE_TELEMETRY: '1', GROK_MEMORY: '0' },
-  flags: { args: ['--help'], needs: ['--single', '--output-format', 'streaming-json', '--permission-mode', '--disallowed-tools', '--no-auto-update'] },
+  flags: { args: ['--help'], needs: ['--single', '--output-format', 'streaming-json', '--permission-mode', '--disallowed-tools', '--disable-web-search'] },
   login: { kind: 'device-code', args: ['login', '--device-auth'], urlHosts: ['accounts.x.ai'], parse: deviceCode },
   status: { args: ['models'], parse: ({ code, out }) => ({ loggedIn: code === 0 && !/not authenticated/i.test(out), method: null, plan: null }) },
   logout: ['logout'],
   expired: /Not signed in|not authenticated|invalid_grant|token (has )?expired|401 Unauthorized/i,
   job: {
-    command: ({ prompt, dir, extra }) => ({ args: ['-p', prompt, '--output-format', 'streaming-json', '--cwd', dir, '--no-auto-update',
-      '--disallowed-tools', 'web_search,web_fetch', ...extra] }),
+    command: ({ prompt, dir, extra }) => ({ args: ['-p', prompt, '--output-format', 'streaming-json', '--cwd', dir, '--disable-web-search', ...extra] }),
     // text chunks since the last tool call are the last message; end carries the totals (input_tokens is uncached only)
     event: (e, acc) => {
       if (e.type === 'tool_call') acc.last = '';

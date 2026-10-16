@@ -1,0 +1,36 @@
+# Example: the runner as one hardened container next to a host app. The runner holds every user's home (volume runner-homes) and
+# nothing of the app's (no app data, no app env); the app talks to it over its own API on the `runners` network (harnessbox does not
+# define that API: the host app's runner script does). Each job, login and status runs in a bubblewrap box inside this container.
+services:
+  runner:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args: { CLAUDE_CODE_VERSION: 2.1.300, CODEX_VERSION: 0.162.1, GROK_VERSION: 1.0.52 }
+    image: harnessbox-runner:local
+    user: "10011:10011" # one uid for every home: the box (mount namespace) is the boundary between users
+    command: ["node", "/opt/your-app/runner.mjs"] # your runner script, built FROM this image (the image's default CMD is the probe)
+    volumes:
+      - runner-homes:/homes # /homes/<userId>/<harness>, 0700. Keep it out of the app and out of backups that leave the host
+    tmpfs:
+      - /tmp:size=2g,mode=1777 # job folders and the per-box proxy sockets; tmpfs counts against mem_limit
+    read_only: true
+    networks: [runners] # not internal: the runner's proxy dials the harnesses' hosts. The boxes have their own netns
+    mem_limit: 4g # only if the kernel's memory cgroup is on (cat /sys/fs/cgroup/cgroup.controllers); boxes are not limited one by one
+    pids_limit: 5120 # boxes x 512 tasks (the in-box RLIMIT_NPROC) + the runner
+    security_opt:
+      - no-new-privileges:true
+      # Docker's default profile + unshare, clone, mount, umount2, pivot_root (bubblewrap's namespaces and mounts), generated for the
+      # host's Docker version with seccomp/mkprofile.py. The boxes add their own filter on top (io_uring, AF_VSOCK).
+      - seccomp=./seccomp/seccomp-bwrap.json
+      - systempaths=unconfined # only so a box can mount a fresh /proc (inside the box it is masked again by its own pid namespace)
+      # AppArmor hosts (Ubuntu): the docker-default profile denies mount; you also need an AppArmor profile that allows it (not shipped)
+    cap_drop: [ALL]
+    restart: unless-stopped
+    stop_grace_period: 20s # your script calls runner.close() on SIGTERM, which kills every box
+
+networks:
+  runners: {}
+
+volumes:
+  runner-homes:
