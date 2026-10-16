@@ -5,6 +5,9 @@ call. The host app never holds a credential: the CLI's own login runs in the use
 home; the app only relays the login URL and a code. A box sees only its user's home for that harness and the job folder, and reaches
 the internet only through a CONNECT proxy that allows the harness's own hosts on port 443.
 
+Use it as a library in your own runner process (below), or run it as a **service** that several web apps call over a unix socket,
+each app with its own token and its own users (`node src/server.mjs`, the image's default command; [docs/service.md](docs/service.md)).
+
 Extracted on 2026-10-16 from review-automation's per-user runner (`app/runner/box.mjs`, `rva-runner.mjs`), deployed there for
 Claude Code and Codex. Node 24, Linux (arm64 or x64), bubblewrap, socat; no runtime npm dependencies. Version 0.1.1.
 Install the package tarball from this repository's release, or use a Git dependency. TypeScript declarations and the deployment
@@ -12,7 +15,7 @@ probe are included. The package is not published to the public npm registry.
 TypeScript consumers need `@types/node` in their development dependencies.
 
 ```
-host app ── its own API ── runner process (your script, uid 10011, one hardened container)
+web apps ── unix socket, bearer token ── src/server.mjs (or your own runner script), uid 10011, one hardened container
                             ├─ createRunner(): detect, status, login, logout, purge, run, exec
                             ├─ per box: CONNECT proxy on a unix socket (this process), allowlist per harness
                             └─ bwrap box per call: /homes/<user>/<harness> and the job folder writable, nothing else
@@ -192,37 +195,38 @@ anthropic-experimental/sandbox-runtime (npm 0.0.79 and GitHub main 0ded0c8, 2026
 
 ## Deploy
 
-- `deploy/Dockerfile`: the runner image (Node 24, bubblewrap, socat, python3, CLIs pinned by build args, uid 10011, `/homes`). Your
-  host app builds FROM it with its runner script. The image's default command is the probe.
-- `deploy/compose.yaml`: the container hardening: read-only root, `cap_drop: ALL`, `no-new-privileges`, the bubblewrap seccomp
-  profile, `systempaths=unconfined` (for the box's fresh /proc), tmpfs /tmp, `pids_limit`, `mem_limit`.
+- `deploy/Dockerfile`: the image (Node 24, bubblewrap, socat, python3, CLIs pinned by build args, uid 10011, `/homes`,
+  `/run/harnessbox`). Its default command is the service; to use the library with your own script, build FROM it.
+- `deploy/compose.yaml`: the service and a client app sharing the socket volume, with the container hardening: read-only root,
+  `cap_drop: ALL`, `no-new-privileges`, the bubblewrap seccomp profile, `systempaths=unconfined` (for the box's fresh /proc), tmpfs
+  /tmp, `pids_limit`, `mem_limit`.
 - `deploy/seccomp/`: `mkprofile.py` and `seccomp-bwrap.json`, generated from moby v26.1.5's default profile. Regenerate it for your
   Docker version (the commands are at the top of `mkprofile.py`); older defaults (20.10) still allow io_uring, which the box filter
   then covers. AppArmor hosts need a profile that allows mount (not shipped).
 - `deploy/probe.mjs`: run it inside the deployed container with your network's addresses (`HB_TARGETS`, `HB_PEEK`) before you open
-  the runner to users, and after every Docker, kernel or CLI upgrade.
+  the runner to users, and after every Docker, kernel or CLI upgrade. `deploy/service-smoke.mjs`: the service through its API, from a
+  client.
 
 Before deploying, check on the host: `cat /proc/sys/user/max_user_namespaces` (> 0), `cat /sys/kernel/security/lsm` (AppArmor?),
 `cat /sys/fs/cgroup/cgroup.controllers` (memory?), `docker version` (regenerate the profile).
 
 ## Tests
 
-`npm ci && npm run check`: public TypeScript API checks, box primitives (proxy with stubbed DNS and upstream, scrub, reader, counts, argv, seccomp filter in a real box) and the
-runner end to end with real bubblewrap boxes and fake CLIs (`test/fake-cli.mjs`). Tests that need bubblewrap with user namespaces
+`npm ci && npm run check`: public TypeScript API checks, box primitives (proxy with stubbed DNS and upstream, scrub, reader, counts, argv, seccomp filter in a real box), the
+runner end to end with real bubblewrap boxes and fake CLIs (`test/fake-cli.mjs`), and the service through its client (two clients,
+auth, logins, a review-automation-shaped draft job, cancel, caps, restart, `main()`). Tests that need bubblewrap with user namespaces
 skip themselves without it; CI requires working namespaces before running the suite. Regressions cover unreadable disk usage,
 cumulative output limits, UTF-8 fragmentation, async event failures, queued cancellation and shutdown. A separate test installs
 the packed tarball in a fresh project and invokes its shipped probe without a real account. `node deploy/probe.mjs` with the real
-CLIs is the smoke test; a fake-CLI test is not evidence of an authenticated login or inference.
+CLIs is the smoke test (`deploy/service-smoke.mjs` for the service); a fake-CLI test is not evidence of an authenticated login or inference.
 
 ## How review-automation would use it
 
-Not done yet; review-automation is unchanged. `app/runner/rva-runner.mjs` would keep its app protocol (long polls, leases, progress,
-results, control commands) and its write-review job preparation, and replace its box layer with `createRunner`:
-`box()`/`inBox()`/`detect()`/`cliStatus()`/`login()`/the purge and logout branches become `hb.detect/status/login/logout/purge`,
-`runJob` calls `hb.run` with its Claude allow rules in `args` and the pristine skill in `roBinds`, and the validator box becomes
-`hb.exec`. Two behaviour changes to plan for: homes move from `/homes/<userId>` to `/homes/<userId>/<engine>` (move `.claude*` and
-`.codex` once, or log users in again), and the lock becomes per user and engine instead of per user. The Dockerfile's runner stage
-and compose service map onto `deploy/` one to one.
+Through the service: its server calls `src/client.mjs` for 설정 > AI 연결 (status, login, code, cancel, logout, purge) and for each
+draft job (`POST /v1/runs` with the photos and memo as files, the write-review skill as a read-only folder, `out/` as outputs and
+`validate_draft.py` as the validator), instead of the pool runner polling it. docs/service.md has the request shape. Users' homes
+move from `/homes/<userId>` to `/homes/<client>/<userId>/<engine>` (move `.claude/.credentials.json`, `.claude.json` and
+`.codex/auth.json` once, or log users in again).
 
 ## License
 

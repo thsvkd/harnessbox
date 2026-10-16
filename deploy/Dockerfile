@@ -1,7 +1,8 @@
-# The runner image: Node 24, bubblewrap and socat for the boxes, python3 for validators a host app may run in a box, the pinned
+# The harnessbox image: Node 24, bubblewrap and socat for the boxes, python3 for validators a client may run in a box, the pinned
 # CLIs, one non-root uid that owns /homes, and harnessbox at /opt/harnessbox. Build from the repository root:
-#   docker build -f deploy/Dockerfile -t harnessbox-runner .
-# A host app builds FROM this image, copies its runner script (which imports /opt/harnessbox/src/index.mjs) and sets CMD.
+#   docker build -f deploy/Dockerfile -t harnessbox .
+# It runs the service (src/server.mjs, docs/service.md) on /run/harnessbox/hb.sock. To use the library in your own runner instead,
+# build FROM it, copy your script (importing /opt/harnessbox/src/index.mjs) and set CMD.
 # The CLIs never update themselves inside a box (the adapters' env); a new version is a rebuild with new build args, then detect().
 FROM node:24-bookworm-slim
 RUN apt-get update \
@@ -21,13 +22,15 @@ RUN h=$(mktemp -d) && export HOME=$h PATH=/usr/local/bin:/usr/bin:/bin \
  && claude --version && codex --version && grok --version \
  && claude --help | grep -q -- --restricted && codex exec --help | grep -q -- '--disable <FEATURE>' && grok --help | grep -q -- streaming-json \
  && bwrap --help | grep -q -- --size && rm -rf $h
+# /run/harnessbox: the socket's folder, a volume shared with the client apps (they can connect, not write); Docker copies this owner
+# and mode into a new named volume.
 RUN groupadd -g 10011 harnessbox && useradd -u 10011 -g 10011 -M -d /nonexistent -s /usr/sbin/nologin harnessbox \
- && install -d -o 10011 -g 10011 -m 700 /homes
+ && install -d -o 10011 -g 10011 -m 700 /homes && install -d -o 10011 -g 10011 -m 755 /run/harnessbox
 COPY src /opt/harnessbox/src
-COPY deploy/probe.mjs /opt/harnessbox/deploy/probe.mjs
+COPY deploy/probe.mjs deploy/service-smoke.mjs /opt/harnessbox/deploy/
 COPY package.json /opt/harnessbox/package.json
 ENV NODE_ENV=production
 USER 10011:10011
 WORKDIR /opt/harnessbox
 ENTRYPOINT ["tini", "--"]
-CMD ["node", "/opt/harnessbox/deploy/probe.mjs"]
+CMD ["node", "/opt/harnessbox/src/server.mjs"]

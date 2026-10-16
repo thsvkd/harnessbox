@@ -1,23 +1,31 @@
-# Example: the runner as one hardened container next to a host app. The runner holds every user's home (volume runner-homes) and
-# nothing of the app's (no app data, no app env); the app talks to it over its own API on the `runners` network (harnessbox does not
-# define that API: the host app's runner script does). Each job, login and status runs in a bubblewrap box inside this container.
+# Example: the harnessbox service as one hardened container, and a client app that reaches it over a unix socket in a volume only
+# the two of them mount. The service holds every user's harness home (volume harnessbox-homes); the app holds none and never sees
+# a credential. More apps: give each its own token in clients.json; the socket volume can be shared, or use one service per app.
 services:
-  runner:
+  harnessbox:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
       args: { CLAUDE_CODE_VERSION: 2.1.300, CODEX_VERSION: 0.162.1, GROK_VERSION: 1.0.52 }
-    image: harnessbox-runner:local
+    image: harnessbox:local
     user: "10011:10011" # one uid for every home: the box (mount namespace) is the boundary between users
-    command: ["node", "/opt/your-app/runner.mjs"] # your runner script, built FROM this image (the image's default CMD is the probe)
+    environment:
+      HB_MAX_JOBS: "3" # runs at once (each a CLI); more wait for a slot
+      HB_PIN_CLAUDE_CODE: 2.1.300 # a CLI of another version is not usable (detect at start)
+      HB_PIN_CODEX: 0.162.1
+      HB_PIN_GROK: 1.0.52
+      # HB_HARNESSES: claude-code,codex       # default: all three
+      # HB_MODELS_CLAUDE_CODE: sonnet,opus     # allowed --model values per harness (default: any well-formed name)
     volumes:
-      - runner-homes:/homes # /homes/<userId>/<harness>, 0700. Keep it out of the app and out of backups that leave the host
+      - harnessbox-homes:/homes # /homes/<client>/<user>/<harness>, 0700. Keep it out of every app and out of backups that leave the host
+      - harnessbox-socket:/run/harnessbox # hb.sock (0666 in a 0755 folder of 10011): apps connect, cannot replace it
+      - ./clients.json:/etc/harnessbox/clients.json:ro # {"clients":[{"id":"myapp","tokenSha256":"<sha256 hex of the token>"}]}
     tmpfs:
-      - /tmp:size=2g,mode=1777 # job folders and the per-box proxy sockets; tmpfs counts against mem_limit
+      - /tmp:size=2g,mode=1777 # run folders (/tmp/hb-runs) and the per-box proxy sockets; tmpfs counts against mem_limit
     read_only: true
-    networks: [runners] # not internal: the runner's proxy dials the harnesses' hosts. The boxes have their own netns
+    networks: [egress] # not internal: the service's proxy dials the harnesses' hosts. The boxes have their own netns
     mem_limit: 4g # only if the kernel's memory cgroup is on (cat /sys/fs/cgroup/cgroup.controllers); boxes are not limited one by one
-    pids_limit: 5120 # boxes x 512 tasks (the in-box RLIMIT_NPROC) + the runner
+    pids_limit: 5120 # boxes x 512 tasks (the in-box RLIMIT_NPROC) + the service
     security_opt:
       - no-new-privileges:true
       # Docker's default profile + unshare, clone, mount, umount2, pivot_root (bubblewrap's namespaces and mounts), generated for the
@@ -27,10 +35,22 @@ services:
       # AppArmor hosts (Ubuntu): the docker-default profile denies mount; you also need an AppArmor profile that allows it (not shipped)
     cap_drop: [ALL]
     restart: unless-stopped
-    stop_grace_period: 20s # your script calls runner.close() on SIGTERM, which kills every box
+    stop_grace_period: 20s # SIGTERM kills every box; runs in progress fail and the app requeues them
+
+  # a client app: it mounts the socket folder (and nothing of harnessbox's) and keeps its token in its own secrets
+  app:
+    image: your-app:local
+    user: "10001:10001"
+    environment:
+      HARNESSBOX_SOCKET: /run/harnessbox/hb.sock
+      HARNESSBOX_TOKEN: ${HARNESSBOX_TOKEN} # the token whose sha256 is in clients.json
+    volumes:
+      - harnessbox-socket:/run/harnessbox
+    networks: [default]
 
 networks:
-  runners: {}
+  egress: {}
 
 volumes:
-  runner-homes:
+  harnessbox-homes:
+  harnessbox-socket:

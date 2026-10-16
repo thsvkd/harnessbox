@@ -242,12 +242,14 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       }
       if (p[3] !== 'harnesses') no(404, 'not_found', 'not found');
       if (p.length === 4 && m === 'GET') {
-        const list = await Promise.all(allowed(c).filter((h) => h.usable).map(async (h) => {
-          try { return { harness: h.id, ...(await status(scoped, h.id)) }; } catch (e) {
-            if (e instanceof Busy) return { harness: h.id, busy: true, ...(statuses.get(`${scoped}/${h.id}`)?.status ?? {}) };
-            return { harness: h.id, error: String(e.message).slice(0, 200) };
+        // one after another: the runner allows maxQuick status boxes at once for everybody
+        const list = [];
+        for (const h of allowed(c).filter((x) => x.usable)) {
+          try { list.push({ harness: h.id, ...(await status(scoped, h.id)) }); } catch (e) {
+            if (e instanceof Busy) list.push({ harness: h.id, busy: true, ...(statuses.get(`${scoped}/${h.id}`)?.status ?? {}) });
+            else list.push({ harness: h.id, error: String(e.message).slice(0, 200) });
           }
-        }));
+        }
         return json(res, 200, { harnesses: list });
       }
       const h = harnessOf(c, p[4]).id, k = `${scoped}/${h}`;
@@ -310,14 +312,14 @@ async function main() {
   await mkdir(runs, { recursive: true, mode: 0o700 });
   for (const n of await readdir(runs)) await rm(join(runs, n), { recursive: true, force: true });
   const hb = await createRunner({ homes: env.HB_HOMES ?? '/homes', adapters, bins: pick('HB_BIN_'), pins: pick('HB_PIN_'), bwrap: env.HB_BWRAP ?? 'bwrap', socat: env.HB_SOCAT ?? 'socat',
-    maxJobs: Number(env.HB_MAX_JOBS) || 3, log });
+    maxJobs: Number(env.HB_MAX_JOBS) || 3, maxQuick: Number(env.HB_MAX_QUICK) || 4, log });
   const harnesses = await hb.detect();
   for (const h of harnesses) log(`${h.id} ${h.version ?? '-'} ${h.usable ? 'usable' : `not usable: ${h.why}`}`);
   const models = Object.fromEntries(Object.entries(pick('HB_MODELS_')).map(([k, v]) => [k, v.split(',')]));
   const svc = createService({ hb, harnesses, clients, runs, models, limits: env.HB_MAX_BODY ? { body: Number(env.HB_MAX_BODY) } : {}, log });
   const tcp = /^([^/][^:]*):(\d+)$/.exec(listen);
   if (!tcp) { await mkdir(dirname(listen), { recursive: true }); await rm(listen, { force: true }); }
-  await new Promise((done) => (tcp ? svc.server.listen(Number(tcp[2]), tcp[1], done) : svc.server.listen(listen, done)));
+  await new Promise((done, fail) => { svc.server.once('error', fail); if (tcp) svc.server.listen(Number(tcp[2]), tcp[1], done); else svc.server.listen(listen, done); });
   // the socket's folder is a volume shared with the client apps only; the bearer token is the other half
   if (!tcp) await chmod(listen, 0o666);
   log(`listening on ${listen} for ${clients.length} client(s)`);
