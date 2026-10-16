@@ -10,7 +10,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { claudeCode, codex, createRunner, grok } from '../src/index.mjs';
-import { harnessbox } from '../src/client.mjs';
+import { harnessbox, HarnessboxError } from '../src/client.mjs';
 import { BOX_DIR, createService } from '../src/server.mjs';
 
 const HERE = import.meta.dirname;
@@ -223,5 +223,24 @@ test('main: a bad HB_MAX_OUTPUT_BYTES stops the service at start', async () => {
       env: { PATH: process.env.PATH, HB_MAX_OUTPUT_BYTES: value, HB_CLIENTS: '/nonexistent/clients.json' } });
     assert.notEqual(r.status, 0, value);
     assert.match(r.stderr, /HB_MAX_OUTPUT_BYTES must be a positive integer/, value);
+  }
+});
+
+test('client: an event that is not JSON rejects that subscription with bad_event, and the process lives on', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-client-sse-')), sock = join(root, 'fake.sock');
+  const fake = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: state\ndata: {"id":"run_x","state":"running"}\n\n');
+    res.write('event: progress\ndata: {not json\n\n');
+  });
+  await new Promise((r) => fake.listen(sock, r));
+  try {
+    const seen = [];
+    await assert.rejects(harnessbox({ socketPath: sock, token: TOKEN.a }).events('run_x', (event, run) => seen.push(`${event}:${run.state}`)), (e) => e instanceof HarnessboxError && e.code === 'bad_event');
+    assert.deepEqual(seen, ['state:running'], 'the events before the broken one still arrived');
+  } finally {
+    fake.closeAllConnections();
+    fake.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });

@@ -8,6 +8,8 @@
   empty home, SSE events and cancel (docs/service.md). `harnessbox/client` is its dependency-free client.
 - Runner: user ids may be `scope/user`; `run()` takes `boxDir`, `model`, `onStart`, and `onEvent` gets `{ stage }`; `exec()` takes
   `boxDir`, `signal` and `home` (a throwaway home, no lock). `boxArgs()` takes `boxDir`.
+- `harnessbox/client`: an event whose data is not JSON rejects `events()` with `bad_event` instead of throwing in the stream
+  listener (which ended the calling app's process).
 - The service reads `HB_MAX_OUTPUT_BYTES` (a run's stdout + stderr, default 8 MiB) and refuses to start on a bad value.
 - Deploy: `deploy/service-smoke.mjs`, `deploy/move-homes.sh`; compose shows the service with a client app sharing the socket.
 

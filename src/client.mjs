@@ -43,7 +43,8 @@ export function harnessbox({ socketPath, url, token }) {
     run: (body) => call('POST', '/v1/runs', body),
     getRun: (id) => call('GET', `/v1/runs/${encodeURIComponent(id)}`),
     cancelRun: (id) => call('DELETE', `/v1/runs/${encodeURIComponent(id)}`),
-    /** Follow a run's events (state, progress) until it ends; resolves to the final run, outputs included. */
+    /** Follow a run's events (state, progress) until it ends; resolves to the final run, outputs included. Rejects with
+     *  HarnessboxError code 'bad_event' when an event is not JSON, 'stream_ended' when the stream ends first. */
     events: (id, onEvent = () => {}) => new Promise((done, fail) => {
       request('GET', `/v1/runs/${encodeURIComponent(id)}/events`, undefined, (res) => {
         if (res.statusCode !== 200) { res.resume(); return fail(new HarnessboxError(res.statusCode)); }
@@ -56,7 +57,12 @@ export function harnessbox({ socketPath, url, token }) {
             buf = buf.slice(i + 2);
             const event = /^event: (.+)$/m.exec(block)?.[1], data = /^data: (.+)$/m.exec(block)?.[1];
             if (!event || !data) continue;
-            const run = JSON.parse(data);
+            let run;
+            try { run = JSON.parse(data); } catch {
+              // a broken stream ends this subscription, never the app: an exception here would be uncaught
+              res.destroy();
+              return fail(new HarnessboxError(0, 'bad_event', 'the event stream sent data that is not JSON'));
+            }
             if (event === 'end') last = run;
             try { onEvent(event, run); } catch { /* the caller's */ }
           }
