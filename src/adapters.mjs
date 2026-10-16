@@ -125,7 +125,8 @@ export const codex = {
 // $GROK_HOME/config.toml (GROK_HOME is unset: ~/.grok), written before each box (docs/user-guide/05-configuration.md and
 // 26-config-reference.md of 1.0.52): no reading of Claude Code or Cursor skills, rules, agents, MCP servers or hooks from the home or
 // the job folder, no update check, no telemetry or trace upload, no memory. Project config in the job folder needs folder trust,
-// which headless runs only get with --trust (never passed).
+// which headless runs only get with the hidden --trust (never passed; GROK_FOLDER_TRUST=0 would trust everything). The CLI appends
+// to this file and writes trusted_folders.toml next to it: both are scrubbed and the file rewritten before every box.
 const off = (keys) => keys.map((k) => `${k} = false`).join('\n');
 const GROK_CONFIG = `[cli]
 auto_update = false
@@ -137,6 +138,9 @@ telemetry = false
 trace_upload = false
 
 [memory]
+enabled = false
+
+[memory_v2]
 enabled = false
 
 [compat.claude]
@@ -151,7 +155,7 @@ ${off(['sessions'])}
 /**
  * Grok (the official xAI CLI, `curl -fsSL https://x.ai/cli/install.sh | bash -s <version>`). Credentials in ~/.grok/auth.json, no
  * keyring. Login: `grok login --device-auth` prints (on stderr) an accounts.x.ai URL and a one-time code, then polls auth.x.ai until
- * the user confirms. No status command: `grok models` says "You are not authenticated." when there is no login. Job: headless
+ * the user confirms. No status command: `grok models` says "You are not authenticated." when there is no login (no network then). Job: headless
  * `-p`, streaming-json; web search and fetch off; its own sandbox stays off (no nested user namespace).
  * @type {Adapter}
  */

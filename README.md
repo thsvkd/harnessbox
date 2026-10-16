@@ -66,7 +66,7 @@ box and after every job, so a box cannot plant hooks, shell start-up files or MC
 |---|---|---|---|
 | Version checked | 2.1.300 | 0.162.1 (musl) | 1.0.52 (official xAI CLI) |
 | Login | paste code: `claude auth login` | device code: `codex login --device-auth` | device code: `grok login --device-auth` |
-| Status | `claude auth status --json` (asks its server) | `codex login status` (offline, file only) | `grok models` ("You are not authenticated.") |
+| Status | `claude auth status --json` (asks its server) | `codex login status` (offline, file only) | `grok models` ("You are not authenticated.", offline when logged out) |
 | Credential kept | `.claude/.credentials.json`, `.claude.json` (account keys only) | `.codex/auth.json` (forced file store) | `.grok/auth.json` |
 | Box hosts | api.anthropic.com, platform.claude.com | auth.openai.com, chatgpt.com | auth.x.ai, cli-chat-proxy.grok.com, api.x.ai |
 | Job | `-p`, stream-json, dontAsk, `--restricted`, `--strict-mcp-config`, no session persistence, no web tools | `exec --json`, `--ignore-user-config`, workspace-write sandbox without network/MCP/apps/plugins/web search | `-p`, streaming-json, web search off |
