@@ -4,11 +4,18 @@
   "description": "Per-user bubblewrap boxes for agent CLIs (Claude Code, Codex, Grok): each user's own login, an egress allowlist, no credential in the host app",
   "type": "module",
   "exports": "./src/index.mjs",
-  "files": ["src"],
-  "engines": { "node": ">=24" },
-  "os": ["linux"],
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "os": [
+    "linux"
+  ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "probe": "node deploy/probe.mjs"
-  }
+  },
+  "license": "MIT"
 }

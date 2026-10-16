@@ -202,4 +202,4 @@ and compose service map onto `deploy/` one to one.
 
 ## License
 
-Not chosen yet.
+MIT, see [LICENSE](LICENSE).
