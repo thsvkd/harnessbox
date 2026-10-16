@@ -16,7 +16,7 @@ import { Busy, createRunner } from './runner.mjs';
 export const BOX_DIR = '/work';
 export const LIMITS = {
   body: 64 * 2 ** 20, prompt: 256 * 1024, files: 2000, filesBytes: 48 * 2 ** 20, outputs: 32, output: 2 * 2 ** 20, outputsBytes: 16 * 2 ** 20,
-  activeRuns: 16, keptRuns: 200, logins: 4, runTimeoutMs: 2 * 3600e3, validateMs: 10 * 60e3, keepMs: 30 * 60e3, statusFreshMs: 30e3, readyMs: 30e3,
+  activeRuns: 16, keptRuns: 200, keptBytes: 256 * 2 ** 20, inflightBytes: 128 * 2 ** 20, streams: 32, logins: 4, runTimeoutMs: 2 * 3600e3, validateMs: 10 * 60e3, keepMs: 30 * 60e3, statusFreshMs: 30e3, readyMs: 30e3,
 };
 const CODE = /^[\x21-\x7e]{1,2048}$/, MODEL = /^[A-Za-z0-9._:@/-]{1,100}$/;
 const ACTIVE = new Set(['queued', 'running', 'validating']);
@@ -75,10 +75,14 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     if (cached && Date.now() - cached.at < L.statusFreshMs) return { ...cached.status, checkedAt: new Date(cached.at).toISOString() };
     if (busyNow(scoped, h)) throw new Busy('busy');
     const s = await hb.status(scoped, h, { waitMs: 2000 });
-    statuses.set(k, { status: s, at: Date.now() });
+    remember(scoped, h, s);
     return { ...s, checkedAt: new Date().toISOString() };
   }
-  const remember = (scoped, h, s) => { if (s) statuses.set(`${scoped}/${h}`, { status: s, at: Date.now() }); };
+  const remember = (scoped, h, s) => {
+    if (!s) return;
+    statuses.set(`${scoped}/${h}`, { status: s, at: Date.now() });
+    if (statuses.size > 10000) for (const [k, v] of statuses) if (Date.now() - v.at > L.statusFreshMs) statuses.delete(k); // stale ones only serve busy answers
+  };
 
   // ---- logins: the runner's session; the service keeps the outcome for keepMs after it ends
   const view = (x) => ({ state: x.s.state === 'refused' ? 'starting' : x.s.state, url: x.s.url, code: x.s.code, needsCode: x.s.needsCode, startedAt: x.startedAt, expiresAt: x.expiresAt,
@@ -143,11 +147,11 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
         const data = typeof f.text === 'string' ? Buffer.from(f.text) : Buffer.from(f.base64, 'base64');
         if ((bytes += data.length) > L.filesBytes) no(413, 'too_large', `files: at most ${L.filesBytes} bytes`);
         const ro = readonly.find((p) => f.path.startsWith(`${p}/`)), to = ro ? join(root, 'ro', f.path) : join(work, f.path);
-        await mkdir(dirname(to), { recursive: true });
-        await writeFile(to, data, { flag: 'wx' }).catch((e) => no(400, 'bad_files', e.code === 'EEXIST' ? `file ${f.path} given twice` : `file ${f.path}: ${e.code}`));
+        await mkdir(dirname(to), { recursive: true }).then(() => writeFile(to, data, { flag: 'wx' }))
+          .catch((e) => no(400, 'bad_files', `file ${f.path} clashes with another file or folder (${e.code})`));
       }
-      for (const p of [...readonly, ...outputs.map(dirname).filter((d) => d !== '.')]) await mkdir(join(work, p), { recursive: true });
-      for (const p of readonly) await mkdir(join(root, 'ro', p), { recursive: true });
+      for (const p of [...readonly, ...outputs.map(dirname).filter((d) => d !== '.')]) await mkdir(join(work, p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));
+      for (const p of readonly) await mkdir(join(root, 'ro', p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));
     } catch (e) { await rm(root, { recursive: true, force: true }); throw e; }
     const r = {
       id, client: c.id, user: b.user, scoped, harness: h, model: b.model ?? null, state: 'queued', createdAt: new Date().toISOString(), startedAt: null, endedAt: null,
@@ -173,10 +177,11 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       });
       r.result = res;
       if (res.loggedIn !== undefined) remember(r.scoped, r.harness, res.loggedIn ? null : { installed: true, loggedIn: false, method: null, plan: null });
-      // the validator in a second box of the same user, no network, over the same folder and the same read-only binds
+      // the validator in a second box, no network, over the same folder and the same read-only binds, with an empty home of its own:
+      // the client chose the command, and it must not see the user's credential
       if (validate && !signal.aborted && !res.why && (res.code === 0 || res.timedOut)) {
         set(r, 'validating');
-        const v = await hb.exec(r.scoped, r.harness, validate.argv, { dir: work, boxDir: BOX_DIR, roBinds, ms: validate.ms, signal });
+        const v = await hb.exec(r.scoped, r.harness, validate.argv, { dir: work, boxDir: BOX_DIR, roBinds, ms: validate.ms, signal, home: join(root, 'home') });
         r.validator = { code: v.code, out: v.out, why: v.why };
       }
       // outputs: regular files really at work/<path>, never through a link the box made; too big or missing: null
@@ -188,6 +193,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
         if (text !== null && (total += Buffer.byteLength(text)) <= L.outputsBytes) r.outputs[p] = Buffer.from(text).toString('base64');
         else r.outputs[p] = null;
       }
+      r.bytes = total + Buffer.byteLength(res.text) + Buffer.byteLength(res.stderr) + Buffer.byteLength(r.validator?.out ?? '');
       r.state = signal.aborted || res.canceled ? 'canceled' : res.code === 0 && !res.why ? 'done' : 'failed';
     } catch (e) {
       r.error = String(e.message).slice(0, 300);
@@ -199,10 +205,18 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       emit(r, 'end');
       r.listeners.clear();
       setTimeout(() => runs.delete(r.id), L.keepMs).unref();
+      // ended runs hold their outputs in memory: past keptBytes for everybody, the oldest ended runs go first
+      let kept = 0;
+      for (const x of runs.values()) kept += x.bytes ?? 0;
+      for (const x of runs.values()) { if (kept <= L.keptBytes) break; if (!ACTIVE.has(x.state)) { kept -= x.bytes ?? 0; runs.delete(x.id); } }
     }
   }
   const runOf = (c, id) => { const r = runs.get(id); return r && r.client === c.id ? r : no(404, 'unknown_run', 'no such run (a restart forgets runs)'); };
-  function events(r, req, res) {
+  const streams = new Map(); // client -> open event streams
+  function events(c, r, res) {
+    if ((streams.get(c.id) ?? 0) >= L.streams) no(429, 'too_many_streams', `at most ${L.streams} event streams per client`);
+    streams.set(c.id, (streams.get(c.id) ?? 0) + 1);
+    res.on('close', () => streams.set(c.id, streams.get(c.id) - 1));
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
     const send = (event) => res.write(`event: ${event}\ndata: ${JSON.stringify(snapshot(r, event === 'end'))}\n\n`);
     if (!ACTIVE.has(r.state)) { send('end'); return res.end(); }
@@ -219,13 +233,22 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(data) });
     res.end(data);
   };
-  const body = (req) => new Promise((done, fail) => {
+  const inflight = new Map(); // client -> body bytes being read
+  const body = (c, req) => new Promise((done, fail) => {
     if (Number(req.headers['content-length'] ?? 0) > L.body) return fail(new HttpError(413, 'too_large', `request bodies are at most ${L.body} bytes`));
     const chunks = [];
-    let n = 0;
-    req.on('data', (d) => { n += d.length; if (n > L.body) { req.removeAllListeners('data'); fail(new HttpError(413, 'too_large', `request bodies are at most ${L.body} bytes`)); } else chunks.push(d); });
-    req.on('end', () => { if (n > L.body) return; try { done(n ? JSON.parse(Buffer.concat(chunks)) : null); } catch { fail(new HttpError(400, 'bad_json', 'the body is not JSON')); } });
-    req.on('error', fail);
+    let n = 0, over = null;
+    const add = (d) => inflight.set(c.id, (inflight.get(c.id) ?? 0) + d);
+    const stop = (e) => { if (over) return; over = e; req.removeAllListeners('data'); req.resume(); add(-n); fail(e); };
+    req.on('data', (d) => {
+      n += d.length;
+      add(d.length);
+      if (n > L.body) stop(new HttpError(413, 'too_large', `request bodies are at most ${L.body} bytes`));
+      else if (inflight.get(c.id) > L.inflightBytes) stop(new HttpError(429, 'too_many_uploads', 'too many request bytes in flight for this client'));
+      else chunks.push(d);
+    });
+    req.on('end', () => { if (over) return; add(-n); try { done(n ? JSON.parse(Buffer.concat(chunks)) : null); } catch { fail(new HttpError(400, 'bad_json', 'the body is not JSON')); } });
+    req.on('error', (e) => stop(e));
   });
   async function route(req, res) {
     const c = auth(req), url = new URL(req.url, 'http://x'), m = req.method, p = url.pathname.split('/').slice(1).map(decodeURIComponent);
@@ -266,21 +289,21 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
         if (p.length === 6 && m === 'GET') return json(res, 200, view(x));
         if (p.length === 6 && m === 'DELETE') { x.s.cancel(); await x.s.done; return json(res, 204); }
         if (p.length === 7 && p[6] === 'code' && m === 'POST') {
-          const code = (await body(req))?.code;
+          const code = (await body(c, req))?.code;
           if (typeof code !== 'string' || !CODE.test(code)) no(400, 'bad_code', 'code: printable ASCII without spaces');
           return x.s.submitCode(code) ? json(res, 204) : no(409, 'not_waiting_for_code', 'this login takes no code now');
         }
       }
     }
     if (p[1] === 'runs') {
-      if (p.length === 2 && m === 'POST') { const r = await createRun(c, await body(req)); return json(res, 202, snapshot(r)); }
+      if (p.length === 2 && m === 'POST') { const r = await createRun(c, await body(c, req)); return json(res, 202, snapshot(r)); }
       const r = runOf(c, p[2] ?? '');
       if (p.length === 3 && m === 'GET') return json(res, 200, snapshot(r));
       if (p.length === 3 && m === 'DELETE') {
-        if (ACTIVE.has(r.state)) { r.ac.abort(); if (r.state === 'queued') { r.state = 'canceled'; emit(r, 'state'); } }
+        r.ac.abort(); // a queued run leaves the user's lock and the slot queue at once; the run ends canceled
         return json(res, 204);
       }
-      if (p.length === 4 && p[3] === 'events' && m === 'GET') return events(r, req, res);
+      if (p.length === 4 && p[3] === 'events' && m === 'GET') return events(c, r, res);
     }
     no(404, 'not_found', 'not found');
   }
@@ -288,7 +311,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     route(req, res).catch((e) => {
       const err = e instanceof HttpError ? e : e instanceof Busy ? new HttpError(409, 'busy', 'this user\'s harness is busy (a login or a run); ask again later')
         : e instanceof URIError ? new HttpError(400, 'bad_request', 'bad path') : new HttpError(500, 'internal', 'internal error');
-      if (err.status === 500) log(`error ${e.message}`);
+      if (err.status === 500) log(`error ${e.code ?? e.name}`); // never a message: it may carry a path or a value from the request
       if (res.headersSent) return res.destroy();
       if (err.status === 413) res.setHeader('connection', 'close'); // the rest of that body is not read
       json(res, err.status, { error: { code: err.code, message: err.message } });

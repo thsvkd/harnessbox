@@ -442,12 +442,13 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   }
 
   /** Any command in the user's box for a harness (a validator over a job's output, say), under the user's lock: { code, out, why }.
-   *  net 'none' by default; 'proxy' gives the harness's hosts. boxDir: where the box sees dir. */
-  async function exec(userId, id, argv, { net = 'none', dir, boxDir, ms = 60e3, stdin, env, roBinds, nested = false, signal } = {}) {
+   *  net 'none' by default; 'proxy' gives the harness's hosts. boxDir: where the box sees dir. home: a throwaway home instead of the
+   *  user's (no lock then): for a command someone else chose, which must not see the user's credential. */
+  async function exec(userId, id, argv, { net = 'none', dir, boxDir, ms = 60e3, stdin, env, roBinds, nested = false, signal, home } = {}) {
     const a = harness(id), k = key(user(userId), a), active = signal ? AbortSignal.any([stop.signal, signal]) : stop.signal;
-    const release = await lock(k, Infinity, active);
+    const release = home ? () => {} : await lock(k, Infinity, active);
     try {
-      return await short(a, argv, { home: homeOf(userId, a), net, dir: dir && await realpath(dir), boxDir, ms, stdin, env, roBinds, nested, signal: active, label: `exec=${userId}` });
+      return await short(a, argv, { home: home ?? homeOf(userId, a), net, dir: dir && await realpath(dir), boxDir, ms, stdin, env, roBinds, nested, signal: active, label: `exec=${userId}` });
     } finally { release(); }
   }
 

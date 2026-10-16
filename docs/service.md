@@ -22,8 +22,9 @@ with the same user ids. `src/client.mjs` is a dependency-free client to copy int
 | `HB_BWRAP`, `HB_SOCAT` | on PATH | |
 
 Fixed limits (`LIMITS` in `src/server.mjs`): prompt 256 KiB; 2000 files, 48 MiB decoded; 32 outputs, 2 MiB each, 16 MiB together;
-16 active runs and 200 kept runs per client; 4 waiting logins per client; run time 1 s–2 h (default 40 min); validator 1 s–10 min
-(default 60 s); runs and ended logins are kept 30 minutes; a status is cached 30 s.
+16 active runs and 200 kept runs per client; 256 MiB of ended runs' outputs for everybody (past it the oldest ended runs are
+forgotten early); 128 MiB of request bodies in flight and 32 event streams per client; 4 waiting logins per client; run time
+1 s–2 h (default 40 min); validator 1 s–10 min (default 60 s); runs and ended logins are kept 30 minutes; a status is cached 30 s.
 
 ## API v1
 
@@ -37,13 +38,13 @@ large), 429 (too many runs or logins). `:user` is `[A-Za-z0-9_-]{1,64}`, your ow
 |---|---|
 | `GET /v1/harnesses` | `{ harnesses: [{ id, name, version, usable, why }] }`: what this client may use, as `detect()` found it at start. |
 | `GET /v1/users/:user/harnesses` | `{ harnesses: [{ harness, installed, loggedIn, method, plan, checkedAt } \| { harness, busy: true, …last known } \| { harness, error }] }`: each usable harness, one after another. |
-| `GET /v1/users/:user/harnesses/:h` | `{ harness, installed, loggedIn, method, plan, checkedAt }`, or 409 `busy` while that user's login or run of `:h` holds the box. |
+| `GET /v1/users/:user/harnesses/:h` | `{ harness, installed, loggedIn, method, plan, checkedAt }`: a status at most 30 s old, else asked in a box; 409 `busy` when it would have to ask while that user's login or run of `:h` holds the box. |
 | `POST /v1/users/:user/harnesses/:h/login` | Starts the CLI's own login in the user's box and waits up to 30 s for its URL: `{ state, url, code, needsCode, startedAt, expiresAt }`. A newer login for the same user and harness replaces the old one. |
 | `GET …/login` | The current (or, for 30 minutes, the last) login: `state` is `starting`, `waiting`, `done` (with `status`) or `failed` (with `error`). 404: none. |
 | `POST …/login/code` `{ code }` | Paste-code logins (`needsCode: true`, Claude Code): the code the login page showed the user, to the CLI's stdin, once. 204, 409 when not waiting for one. |
 | `DELETE …/login` | Cancel. 204. |
 | `POST …/:h/logout` | The CLI's own logout, then its status. |
-| `DELETE /v1/users/:user` | Cancels the user's runs and logins, then deletes all their homes. 204. |
+| `DELETE /v1/users/:user` | Cancels the user's runs (queued ones included) and logins, then deletes all their homes. 204. |
 
 Show the user `url` (and `code` for a device login) and nothing else; the URL is always https on the harness's own login hosts.
 A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when the user confirms in their browser: poll
@@ -72,10 +73,10 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
   skill and run its validator but not change them.
 - `outputs`: files read back after the run: regular files only, never through a link, at most 2 MiB each; `null` when missing, a
   link, a FIFO or too big. The parent folders of every output are created before the run.
-- `validate`: a command in a second box of the same user, no network, cwd `/work`, the same read-only folders, after the CLI exited
-  0 or ran out of time (not after a failure or a cancel).
-- `model`: passed as `--model` (all three CLIs). `args`: extra CLI options after the adapter's hardened ones; they run inside the
-  box, so they cannot widen it. `timeoutMs` stops the CLI.
+- `validate`: a command in a second box, no network, cwd `/work`, the same read-only folders and an empty home of its own (not the
+  user's: it never sees their credential), after the CLI exited 0 or ran out of time (not after a failure or a cancel).
+- `model`: passed as `--model` (all three CLIs). `args`: extra CLI options after the adapter's hardened ones. They cannot widen the
+  box, but they can widen what the CLI lets the model do inside it (see the threat model). `timeoutMs` stops the CLI.
 
 `GET /v1/runs/:id` → the run:
 
@@ -97,7 +98,8 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
 
 `GET /v1/runs/:id/events` → Server-Sent Events: `state` (on each state change), `progress` (at most once a second while events
 arrive: `stage`, `events`), and `end` (the full run, outputs included), then the stream closes. Each `data:` is the run as JSON.
-`DELETE /v1/runs/:id` cancels (204). Runs are kept 30 minutes after they end. **A restart forgets every run**: an unknown id is 404,
+`DELETE /v1/runs/:id` cancels (204): a running CLI is killed; a queued run leaves the user's lock and the slot queue at once and
+ends without a box. Runs are kept 30 minutes after they end. **A restart forgets every run**: an unknown id is 404,
 and the client starts the run again.
 
 ## Client module
@@ -125,9 +127,13 @@ After every deploy: `deploy/probe.mjs` inside the service container (isolation, 
 ## Threat model additions
 
 - **A client is trusted for its own users.** It chooses the user ids, the prompts, the files and the CLI options of their runs, and
-  it relays their logins: it can run jobs with any of its users' logins. It cannot reach another client's users (every path, lock,
-  run and login is keyed by the client id taken from the token), nor any credential (only URLs, device codes and pasted codes pass
-  through it).
+  it relays their logins: it can run jobs with any of its users' logins. It cannot reach another client's users: every path, lock,
+  run and login is keyed by the client id taken from the token.
+- **A client could get its own users' credentials out, on purpose.** In normal use no credential passes through it (only URLs,
+  device codes and pasted codes). But the credential is a file in the user's box that the CLI must read, and the client writes the
+  prompt and may add CLI options: a prompt asking Codex (whose own sandbox reads the whole box) or a Claude Code given Bash or broad
+  Read to print the file returns it in the run's text or outputs. The validator cannot (its home is empty). harnessbox does not scan
+  results for credentials. Only let clients you would trust with those credentials connect, and keep the CLIs' tool rules tight.
 - **Tokens** are compared by their SHA-256; the clients file holds only hashes. Whoever can reach the socket or port and holds a
   token is that client. Keep the socket volume to the client apps and the TCP port on a private network.
 - **What the service keeps**: runs (prompts never; outputs and the CLI's last message for 30 minutes) and login sessions (URL and

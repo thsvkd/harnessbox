@@ -129,6 +129,11 @@ test('service: a review-automation-shaped draft job per harness: files in, read-
     const other = await w.b.events((await w.b.run(draftJob('u1', 'claude-code'))).id);
     assert.deepEqual([other.state, other.result.loggedIn, other.validator], ['failed', false, null], 'B\'s u1 has no login; no validator after a failed CLI');
     await assert.rejects(w.a.run(draftJob('u1', 'codex', { model: 'gpt-4o' })), { status: 400, code: 'bad_model' });
+    // the client chooses the validator command: it runs with an empty home of its own, never the user's credential
+    const v = await w.a.events((await w.a.run({ ...draftJob('u1', 'claude-code'), validate: { argv: ['/bin/bash', '-c', 'echo "home=$HOME"; ls -A "$HOME"; cat ~/.claude/.credentials.json'] } })).id);
+    assert.equal(v.state, 'done');
+    assert.doesNotMatch(v.validator.out, /fake/);
+    assert.doesNotMatch(v.validator.out, new RegExp(join(w.homes, 'appa', 'u1')));
     assert.ok(!w.logs.some((l) => /FAKE_MODE|request\.md|draft by/.test(l)), 'no prompt or output in the logs');
   } finally { await w.close(); }
 });
@@ -144,7 +149,8 @@ test('service: cancel, caps, bad requests, purge, and a restart forgets runs', B
     await assert.rejects(w.a.status('u1', 'claude-code'), { status: 409, code: 'busy' });
     assert.deepEqual((await w.a.statuses('u1')).harnesses.find((h) => h.harness === 'claude-code').busy, true);
     assert.equal(await w.a.cancelRun(queued.id), null);
-    assert.equal((await w.a.getRun(queued.id)).state, 'canceled');
+    const left = await w.a.events(queued.id);
+    assert.deepEqual([left.state, left.startedAt], ['canceled', null], 'a queued run leaves the line at once, without a box');
     for (let i = 0; i < 50 && (await w.a.getRun(hang.id)).state !== 'running'; i++) await sleep(100);
     await w.a.cancelRun(hang.id);
     const done = await w.a.events(hang.id);
@@ -154,14 +160,21 @@ test('service: cancel, caps, bad requests, purge, and a restart forgets runs', B
       [{ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: '../evil', text: 'x' }] }, 'bad_files'],
       [{ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: 'a', text: 'x' }, { path: 'a', text: 'y' }] }, 'bad_files'],
       [{ user: 'u1', harness: 'claude-code', prompt: 'x', outputs: ['/etc/passwd'] }, 'bad_path'], [{ user: 'u1', harness: 'claude-code', prompt: 'x', timeoutMs: 1 }, 'bad_timeout'],
-      [{ user: 'u1', harness: 'claude-code', prompt: 'x', validate: { argv: ['true'], net: 'proxy' } }, 'bad_validate']]) {
+      [{ user: 'u1', harness: 'claude-code', prompt: 'x', validate: { argv: ['true'], net: 'proxy' } }, 'bad_validate'],
+      [{ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: 'a', text: 'x' }, { path: 'a/b', text: 'y' }] }, 'bad_files'],
+      [{ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: 'out', text: 'x' }], outputs: ['out/x'] }, 'bad_path']]) {
       await assert.rejects(w.a.run(body), { code }, JSON.stringify(body));
     }
     await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: 'big', text: 'x'.repeat(5000) }] }), { status: 413 });
     assert.equal((await raw(w.sock, 'POST', '/v1/runs', { authorization: `Bearer ${TOKEN.a}`, 'content-type': 'application/json' }, '{nope')).status, 400);
     assert.deepEqual(readdirSync(w.runs), [], 'refused runs leave no folder');
 
+    // purge ends a user's runs, queued ones included, and does not wait behind them
+    const h2 = await w.a.run({ user: 'u2', harness: 'claude-code', prompt: 'FAKE_MODE=hang' }), q2 = await w.a.run({ user: 'u2', harness: 'claude-code', prompt: 'x' });
+    const t = Date.now();
     await w.a.purge('u2');
+    assert.ok(Date.now() - t < 10e3);
+    assert.deepEqual([(await w.a.events(h2.id)).state, (await w.a.events(q2.id)).state], ['canceled', 'canceled']);
     assert.ok(!existsSync(join(w.homes, 'appa', 'u2')) && existsSync(join(w.homes, 'appa', 'u1')));
     await w.close({ keep: true });
     // a new service over the same folders: the old run is unknown (the client requeues), the logins are still there
