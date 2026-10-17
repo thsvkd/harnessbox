@@ -396,6 +396,29 @@ test('run: each harness\'s hardened command in the user\'s own box, cleared envi
   } finally { w.close(); }
 });
 
+test('run: webSearch reaches each adapter\'s command in the box (Claude Code: WebSearch allowed, WebFetch and MCP denied; Codex: web_search=live); Grok refuses it', BOX, async () => {
+  const w = await world();
+  try {
+    const rows = await w.hb.detect();
+    assert.deepEqual(rows.map((r) => [r.id, r.webSearch]), [['claude-code', true], ['codex', true], ['grok', false]]);
+    for (const id of IDS) w.logIn('alice', id);
+    const argsOf = async (id, more) => { const dir = w.job(); const r = await w.hb.run('alice', id, { prompt: 'x', dir, ...more }); assert.equal(r.code, 0, id); return w.seen(dir).args; };
+    for (const more of [{}, { webSearch: false }]) {
+      const c = await argsOf('claude-code', more), x = await argsOf('codex', more);
+      assert.deepEqual(c.slice(c.indexOf('--disallowedTools'), c.indexOf('--disallowedTools') + 4), ['--disallowedTools', 'WebFetch', 'WebSearch', 'mcp__*']);
+      assert.ok(!c.includes('--allowedTools'));
+      assert.ok(x.includes('web_search=disabled') && !x.includes('web_search=live'));
+    }
+    const c = await argsOf('claude-code', { webSearch: true, args: ['--allowedTools', 'Read(//work/**)'] });
+    assert.deepEqual(c.slice(c.indexOf('--disallowedTools'), c.indexOf('--disallowedTools') + 5), ['--disallowedTools', 'WebFetch', 'mcp__*', '--allowedTools', 'WebSearch']);
+    assert.deepEqual(c.slice(-2), ['--allowedTools', 'Read(//work/**)'], 'the caller\'s own rules follow');
+    const x = await argsOf('codex', { webSearch: true });
+    assert.ok(x.includes('web_search=live') && !x.includes('web_search=disabled') && x.includes('sandbox_workspace_write.network_access=false'));
+    await assert.rejects(w.hb.run('alice', 'grok', { prompt: 'x', dir: w.job(), webSearch: true }), /Grok has no web search/);
+    await assert.rejects(w.hb.run('alice', 'codex', { prompt: 'x', dir: w.job(), webSearch: 'yes' }), /webSearch must be true or false/);
+  } finally { w.close(); }
+});
+
 test('run: failures, an expired or missing login, the time limit, a cancel, a fork bomb, a planted home, an egress attempt, a symlinked output', BOX, async () => {
   const w = await world({ maxProcs: 20, env: { FAKE_PROCS: '200' } });
   try {

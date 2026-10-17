@@ -211,7 +211,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   async function detectHarnesses() {
     const rows = new Map();
     for (const a of adapters) {
-      const r = { id: a.id, name: a.name, bin: BIN[a.id], version: null, usable: false, why: null, has: new Set() }, home = join(homes, '.probe', a.id);
+      const r = { id: a.id, name: a.name, bin: BIN[a.id], version: null, usable: false, why: null, has: new Set(), webSearch: !!a.webSearch }, home = join(homes, '.probe', a.id);
       const run = (args, nested = false) => short(a, cli(a, args), { home, label: 'probe', nested });
       try {
         if (!r.bin) { r.why = 'binary not found'; continue; }
@@ -365,11 +365,14 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
    * ({input, output[, unknown]}), error, stderr (tail), why (watchdog), timedOut, canceled, loggedIn (after a failure: false when the
    * login is gone, else the CLI's status) }. roBinds: read-only paths in the box (e.g. a pristine skill over dir/skill). boxDir: where
    * the box sees dir (default: the same path). model: the CLI's --model. onStart(): the box started (it waited for the lock and a
-   * slot until then). onEvent(e, { stage }): each JSON event.
+   * slot until then). onEvent(e, { stage }): each JSON event. webSearch: the CLI's own server-side web search on (adapters with
+   * webSearch only).
    */
-  async function run(userId, id, { prompt, dir, boxDir, model, timeoutMs = 40 * 60e3, args = [], env = {}, roBinds = [], signal, onStart, onEvent } = {}) {
+  async function run(userId, id, { prompt, dir, boxDir, model, timeoutMs = 40 * 60e3, args = [], env = {}, roBinds = [], signal, onStart, onEvent, webSearch = false } = {}) {
     const a = usable(id), k = key(user(userId), a);
     if (typeof prompt !== 'string' || !prompt || prompt.startsWith('-') || prompt.includes('\0')) throw new Error('prompt must be a non-empty string not starting with "-"');
+    if (typeof webSearch !== 'boolean') throw new Error('webSearch must be true or false');
+    if (webSearch && !a.webSearch) throw new Error(`${a.name} has no web search`);
     const canceledResult = () => ({ code: -1, text: '', usage: { input: 0, output: 0, unknown: true }, error: '', stderr: '', why: stop.signal.aborted ? 'runner closed' : null, timedOut: false, canceled: true });
     const activeSignal = signal ? AbortSignal.any([stop.signal, signal]) : stop.signal;
     let release, free;
@@ -383,7 +386,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
       free = await jobSlots.acquire(activeSignal);
       activeSignal.throwIfAborted();
       await mkdir(join(dir, '.tmp'), { recursive: true });
-      const tmp = join(boxDir, '.tmp'), c = a.job.command({ prompt, dir: boxDir, has: detected.get(id).has, extra: [...(model ? ['--model', model] : []), ...args] });
+      const tmp = join(boxDir, '.tmp'), c = a.job.command({ prompt, dir: boxDir, has: detected.get(id).has, extra: [...(model ? ['--model', model] : []), ...args], webSearch });
       const b = await spawnBox(a, { home: homeOf(userId, a), net: 'proxy', dir, boxDir, cmd: cli(a, c.args), stdin: c.stdin == null ? 'ignore' : 'pipe',
         env: { TMPDIR: tmp, TMP: tmp, TEMP: tmp, ...env }, label: `job=${userId}`, roBinds, nested: !!a.nested, signal: activeSignal });
       if (c.stdin != null) b.child.stdin.end(c.stdin);
