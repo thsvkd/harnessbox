@@ -24,8 +24,10 @@ with the same user ids. `src/client.mjs` is a dependency-free client: import it 
 | `HB_BWRAP`, `HB_SOCAT` | on PATH | |
 
 Fixed limits (`LIMITS` in `src/server.mjs`): prompt 256 KiB; 2000 files, 48 MiB decoded; 32 outputs, 2 MiB each, 16 MiB together;
-16 active runs and 200 kept runs per client; 256 MiB of ended runs' outputs (with their kept events) for everybody (past it the
-oldest ended runs are forgotten early); kept events 1 MiB per run, 64 KiB per event; 128 MiB of request bodies in flight and 32 event streams per client; 4 waiting logins per client; run time
+16 active runs and 200 kept runs per client; 256 MiB of ended runs' outputs for everybody (past it the oldest ended runs are
+forgotten early: outputs, last message, stderr, validator output and kept events, the events at the size their JSON text takes in
+memory, one or two bytes a character plus 32 bytes each; an active run's events count only once it ends); kept events 2000 and
+1 MiB of JSON per run, 64 KiB and 64 levels of nesting per event; 128 MiB of request bodies in flight and 32 event streams per client; 4 waiting logins per client; run time
 1 s–2 h (default 40 min); validator 1 s–10 min (default 60 s); runs and ended logins are kept 30 minutes; a status is cached 30 s.
 
 ## API v1
@@ -87,8 +89,11 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
   the box's hosts are the same (see the threat model).
 - `events: true` (only for a client whose entry has `"events": true`, else 400 `events_not_allowed`): the run's
   `result.events` holds the CLI's stdout events, each line that parsed as a JSON object, as printed (Claude Code's stream-json,
-  Codex's `--json`, Grok's streaming-json), in order: the first 1 MiB of them (as JSON, a comma each; then `result.eventsTruncated:
-  true`), an event over 64 KiB replaced by `{ type, truncated: true }`. Their fields come from the box: validate before use.
+  Codex's `--json`, Grok's streaming-json), in order: the first 2000 and the first 1 MiB of them (as JSON, a comma each; past
+  either, `result.eventsTruncated: true`). An event over 64 KiB, nested deeper than 64 levels, or too deep to serialize at all is
+  replaced by `{ type, truncated: true }`, so that parsing and serializing `result.events` again cannot exhaust a stack. The service
+  keeps each event as the JSON text it measured and writes that text into the answer, never serializing a box's object again.
+  Their fields come from the box: validate before use.
 - `webSearch` and `events` false or absent: the run and its result are exactly as without them (no `events` in `result`).
 
 `GET /v1/runs/:id` → the run:

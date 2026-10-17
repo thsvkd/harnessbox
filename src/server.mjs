@@ -16,7 +16,7 @@ import { Busy, createRunner } from './runner.mjs';
 export const BOX_DIR = '/work';
 export const LIMITS = {
   body: 64 * 2 ** 20, prompt: 256 * 1024, files: 2000, filesBytes: 48 * 2 ** 20, outputs: 32, output: 2 * 2 ** 20, outputsBytes: 16 * 2 ** 20,
-  eventsBytes: 2 ** 20, eventBytes: 64 * 1024, activeRuns: 16, keptRuns: 200, keptBytes: 256 * 2 ** 20, inflightBytes: 128 * 2 ** 20, streams: 32, logins: 4, runTimeoutMs: 2 * 3600e3, validateMs: 10 * 60e3, keepMs: 30 * 60e3, statusFreshMs: 30e3, readyMs: 30e3,
+  eventsBytes: 2 ** 20, eventBytes: 64 * 1024, eventDepth: 64, eventsCount: 2000, activeRuns: 16, keptRuns: 200, keptBytes: 256 * 2 ** 20, inflightBytes: 128 * 2 ** 20, streams: 32, logins: 4, runTimeoutMs: 2 * 3600e3, validateMs: 10 * 60e3, keepMs: 30 * 60e3, statusFreshMs: 30e3, readyMs: 30e3,
 };
 const CODE = /^[\x21-\x7e]{1,2048}$/, MODEL = /^[A-Za-z0-9._:@/-]{1,100}$/;
 const ACTIVE = new Set(['queued', 'running', 'validating']);
@@ -113,7 +113,20 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     id: r.id, user: r.user, harness: r.harness, model: r.model, state: r.state, createdAt: r.createdAt, startedAt: r.startedAt, endedAt: r.endedAt,
     stage: r.stage, events: r.events, ...(r.error ? { error: r.error } : {}), result: r.result, validator: r.validator, ...(full ? { outputs: r.outputs } : {}),
   });
-  const emit = (r, event) => { for (const l of r.listeners) l(event); };
+  // a run as JSON. Kept events are JSON text already (keep()), spliced in where result.events holds MARK: never parsed or serialized
+  // again. Never throws (this runs in execute()'s finally, through emit): past a failure, the run without its events
+  // (eventsTruncated) or, last, its id and state.
+  const MARK = `hb-events-${randomBytes(12).toString('hex')}`;
+  const runJson = (r, full = true) => {
+    const s = snapshot(r, full);
+    try {
+      const t = JSON.stringify(s), i = r.kept && s.result ? t.indexOf(`"${MARK}"`) : -1;
+      return i < 0 ? t : `${t.slice(0, i)}[${r.kept.list.join(',')}]${t.slice(i + MARK.length + 2)}`;
+    } catch {
+      try { return JSON.stringify({ ...s, ...(s.result ? { result: { ...s.result, events: [], eventsTruncated: true } } : {}) }); } catch { return JSON.stringify({ id: r.id, state: r.state, error: 'the run could not be serialized' }); }
+    }
+  };
+  const emit = (r, event) => { for (const l of r.listeners) { try { l(event); } catch { /* one subscriber cannot end the run or the service */ } } };
   const set = (r, state) => { if (r.state === state || !ACTIVE.has(r.state)) return; r.state = state; if (state === 'running') r.startedAt = new Date().toISOString(); emit(r, 'state'); };
   async function createRun(c, b) {
     if (!b || typeof b !== 'object') no(400, 'bad_request', 'a JSON object is required');
@@ -151,7 +164,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     const r = {
       id, client: c.id, user: b.user, scoped, harness: h, model: b.model ?? null, state: 'queued', createdAt: new Date().toISOString(), startedAt: null, endedAt: null,
       stage: '', events: 0, result: null, validator: null, outputs: null, error: null, ac: new AbortController(), listeners: new Set(),
-      kept: b.events ? { list: [], bytes: 0, truncated: false } : null,
+      kept: b.events ? { list: [], bytes: 0, mem: 0, truncated: false } : null,
     };
     // Reserve admission before the first filesystem await, including concurrent uploads still being staged.
     runs.set(id, r);
@@ -178,18 +191,33 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       for (const p of readonly) await mkdir(join(root, 'ro', p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));
     } catch (e) { runs.delete(id); if (root) await rm(root, { recursive: true, force: true }); throw e; }
     log(`run client=${c.id} run=${id} user=${scoped} harness=${h} queued`);
-    void execute(r, { root, work, prompt: b.prompt, timeoutMs, args, outputs, validate, webSearch: b.webSearch === true, roBinds: readonly.map((p) => [join(root, 'ro', p), join(BOX_DIR, p)]) });
+    execute(r, { root, work, prompt: b.prompt, timeoutMs, args, outputs, validate, webSearch: b.webSearch === true, roBinds: readonly.map((p) => [join(root, 'ro', p), join(BOX_DIR, p)]) })
+      .catch((e) => log(`error run=${id} ${e?.name ?? 'error'}`)); // never an unhandled rejection: it would end the service
     return r;
   }
-  // events: true keeps the CLI's JSON events for result.events, the first L.eventsBytes of them (as JSON, a comma each); an event over
-  // L.eventBytes is kept as { type, truncated: true }
+  // events: true keeps the CLI's JSON events for result.events as JSON text, the first L.eventsCount and L.eventsBytes of them (a comma
+  // each). An event that does not serialize (nested past the stack), is over L.eventBytes or nests deeper than L.eventDepth is kept as
+  // { type, truncated: true }: a client that parses and serializes it again must not hit its own stack limit. k.mem is what the texts
+  // take in memory (two bytes a character when one is past U+00FF, plus a string's own header), for keptBytes.
+  const depth = (t) => {
+    let d = 0, max = 0, str = false;
+    for (let i = 0; i < t.length; i++) {
+      const ch = t.charCodeAt(i);
+      if (str) { if (ch === 92) i++; else if (ch === 34) str = false; } else if (ch === 34) str = true;
+      else if (ch === 123 || ch === 91) max = Math.max(max, ++d); else if (ch === 125 || ch === 93) d--;
+    }
+    return max;
+  };
   const keep = (k, e) => {
     if (k.truncated) return;
-    let item = e, size = Buffer.byteLength(JSON.stringify(e));
-    if (size > L.eventBytes) { item = { type: typeof e.type === 'string' ? e.type.slice(0, 100) : null, truncated: true }; size = Buffer.byteLength(JSON.stringify(item)); }
-    if (k.bytes + size + 1 > L.eventsBytes) { k.truncated = true; return; }
+    let t = null;
+    try { t = JSON.stringify(e); } catch { /* too deep for this stack */ }
+    if (typeof t !== 'string' || Buffer.byteLength(t) > L.eventBytes || depth(t) > L.eventDepth) t = JSON.stringify({ type: typeof e.type === 'string' ? e.type.slice(0, 100) : null, truncated: true });
+    const size = Buffer.byteLength(t);
+    if (k.list.length >= L.eventsCount || k.bytes + size + 1 > L.eventsBytes) { k.truncated = true; return; }
     k.bytes += size + 1;
-    k.list.push(item);
+    k.mem += (/[^\x00-\xff]/.test(t) ? 2 : 1) * t.length + 32;
+    k.list.push(t);
   };
   async function execute(r, { root, work, prompt, timeoutMs, args, outputs, validate, webSearch, roBinds }) {
     const signal = r.ac.signal;
@@ -205,7 +233,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
           if (Date.now() - last >= 1000) { last = Date.now(); emit(r, 'progress'); }
         },
       });
-      r.result = r.kept ? { ...res, events: r.kept.list, eventsTruncated: r.kept.truncated } : res;
+      r.result = r.kept ? { ...res, events: MARK, eventsTruncated: r.kept.truncated } : res; // runJson puts the events in
       if (res.loggedIn !== undefined) remember(r.scoped, r.harness, res.loggedIn ? null : { installed: true, loggedIn: false, method: null, plan: null });
       // the validator in a second box, no network, over the same folder and the same read-only binds, with an empty home of its own:
       // the client chose the command, and it must not see the user's credential
@@ -223,7 +251,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
         if (bytes !== null && (total += bytes.length) <= L.outputsBytes) r.outputs[p] = bytes.toString('base64');
         else r.outputs[p] = null;
       }
-      r.bytes = total + Buffer.byteLength(res.text) + Buffer.byteLength(res.stderr) + Buffer.byteLength(r.validator?.out ?? '') + (r.kept?.bytes ?? 0);
+      r.bytes = total + Buffer.byteLength(res.text) + Buffer.byteLength(res.stderr) + Buffer.byteLength(r.validator?.out ?? '') + (r.kept?.mem ?? 0);
       r.state = signal.aborted || res.canceled ? 'canceled' : res.code === 0 && !res.why ? 'done' : 'failed';
     } catch (e) {
       r.error = String(e.message).slice(0, 300);
@@ -236,7 +264,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       r.listeners.clear();
       setTimeout(() => runs.delete(r.id), L.keepMs).unref();
       // ended runs hold their outputs (and kept events) in memory: past keptBytes for everybody, the oldest ended runs go first
-      r.bytes ??= r.kept?.bytes ?? 0;
+      r.bytes ??= r.kept?.mem ?? 0;
       let kept = 0;
       for (const x of runs.values()) kept += x.bytes ?? 0;
       for (const x of runs.values()) { if (kept <= L.keptBytes) break; if (!ACTIVE.has(x.state)) { kept -= x.bytes ?? 0; runs.delete(x.id); } }
@@ -249,7 +277,8 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     streams.set(c.id, (streams.get(c.id) ?? 0) + 1);
     res.on('close', () => streams.set(c.id, streams.get(c.id) - 1));
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
-    const send = (event) => res.write(`event: ${event}\ndata: ${JSON.stringify(snapshot(r, event === 'end'))}\n\n`);
+    res.on('error', () => {}); // a subscriber gone mid-write is not the service's error
+    const send = (event) => res.write(`event: ${event}\ndata: ${runJson(r, event === 'end')}\n\n`);
     if (!ACTIVE.has(r.state)) { send('end'); return res.end(); }
     send('state');
     const ping = setInterval(() => res.write(': ping\n\n'), 15e3);
@@ -259,8 +288,10 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   }
 
   // ---- HTTP
-  const json = (res, status, body) => {
-    const data = body === undefined ? '' : JSON.stringify(body);
+  /** text: the body as JSON already (runJson) */
+  const json = (res, status, body, text) => {
+    let data;
+    try { data = text ?? (body === undefined ? '' : JSON.stringify(body)); } catch { status = 500; data = JSON.stringify({ error: { code: 'internal', message: 'internal error' } }); }
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(data) });
     res.end(data);
   };
@@ -327,9 +358,9 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       }
     }
     if (p[1] === 'runs') {
-      if (p.length === 2 && m === 'POST') { const r = await createRun(c, await body(c, req)); return json(res, 202, snapshot(r)); }
+      if (p.length === 2 && m === 'POST') { const r = await createRun(c, await body(c, req)); return json(res, 202, undefined, runJson(r)); }
       const r = runOf(c, p[2] ?? '');
-      if (p.length === 3 && m === 'GET') return json(res, 200, snapshot(r));
+      if (p.length === 3 && m === 'GET') return json(res, 200, undefined, runJson(r));
       if (p.length === 3 && m === 'DELETE') {
         r.ac.abort(); // a queued run leaves the user's lock and the slot queue at once; the run ends canceled
         return json(res, 204);

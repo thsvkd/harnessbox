@@ -12,7 +12,8 @@
 // sleeping children), plant (shell and settings files in the home, a credential file replaced by a link), egress (CONNECT
 // example.com:443 through the box's proxy), symlink (codex: the last-message file is a link to FAKE_TARGET), junk (JSON lines that
 // are not objects and a result with non-numeric usage before the usual events), rva (review-automation's draft job: out/draft.json,
-// draft.md, handoff.md, a try at rewriting skill/validate.sh (loud: 5000 bytes on stderr first), out/evil.json linked to the credential, a 50000-byte out/big.txt). FAKE_LOGIN_NOURL: `claude auth login` exits 0 at once.
+// draft.md, handoff.md, a try at rewriting skill/validate.sh (loud: 5000 bytes on stderr first), out/evil.json linked to the credential, a 50000-byte out/big.txt),
+// deep-<n> (one event nested n objects deep, as a hostile box can print, before the usual events). FAKE_LOGIN_NOURL: `claude auth login` exits 0 at once.
 import { spawn, spawnSync } from 'node:child_process';
 import { accessSync, chmodSync, existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
@@ -103,6 +104,8 @@ export async function main(kind) {
     loggedIn: loggedIn(), userns: spawnSync('unshare', ['-Ur', 'true']).status === 0, peek: Object.fromEntries((process.env.FAKE_PEEK ?? '').split(',').filter(Boolean).map((p) => [p, seen(p)])) };
   if (mode === 'egress') saw.egress = { denied: await connect('example.com') }; // allowed tunneling is covered with a local upstream in box.test.mjs
   writeFileSync(join(dir, 'seen.json'), JSON.stringify(saw));
+  const deep = Number(/^deep-(\d+)$/.exec(mode)?.[1] ?? 0);
+  if (deep) process.stdout.write(`{"type":"deep","a":${'{"a":'.repeat(deep)}1${'}'.repeat(deep)}}\n`);
   const hang = () => { process.on('SIGTERM', () => process.exit(143)); setInterval(() => {}, 1000); };
   if (kind === 'claude') console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 's1', model: 'claude-sonnet-5-5' }));
   if (!loggedIn()) {

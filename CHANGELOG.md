@@ -10,9 +10,12 @@
 - Service: a client entry may set `"webSearch": true` and `"events": true` (default false; another value stops the service at
   start). `POST /v1/runs` takes `webSearch` and `events`; asking for one the client is not allowed is a 400
   (`web_search_not_allowed`, `events_not_allowed`; `web_search_unsupported` for Grok). `events: true` puts the CLI's JSON events
-  in `result.events` (1 MiB, 64 KiB per event, `eventsTruncated`), counted in the 256 MiB of ended runs. Runs without the fields
-  are unchanged.
-- `harnessbox/client`: types for `webSearch`, `events`, `result.events` and `result.eventsTruncated`.
+  in `result.events` (2000 events and 1 MiB per run, 64 KiB and 64 levels of nesting per event, `eventsTruncated`). They are kept
+  as the JSON text measured on arrival and written into answers as such; an event that does not serialize or is too deep becomes
+  `{ type, truncated: true }`, and a run's answer, SSE events included, falls back to the run without its events rather than
+  throwing. Ended runs' kept events count against the 256 MiB at their in-memory size (an active run's once it ends). Runs
+  without the fields are unchanged.
+- `harnessbox/client`: types for `webSearch`, `events`, `result.events`, `result.eventsTruncated`.
 
 ## 0.2.0
 

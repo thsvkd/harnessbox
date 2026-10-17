@@ -249,6 +249,23 @@ test('service: a client allowed webSearch and events gets the CLI\'s events thro
   } finally { await w.close(); }
 });
 
+test('service: a box printing an event nested 4073, 5000 or 100000 deep: the run ends normally, the event is { type, truncated }, the service lives', BOX, async () => {
+  const w = await world();
+  try {
+    for (const id of ['claude-code', 'codex']) w.logIn('appc', 'u1', id);
+    for (const [harness, n] of [['codex', 4073], ['codex', 5000], ['codex', 100000], ['claude-code', 5000]]) {
+      const id = (await w.c.run({ user: 'u1', harness, prompt: `FAKE_MODE=deep-${n}`, events: true })).id;
+      const ended = await w.c.events(id), got = await w.c.getRun(id);
+      assert.deepEqual(ended, got, `${harness} ${n}`);
+      assert.equal(got.state, 'done');
+      assert.equal(got.result.text, `done (deep-${n})`);
+      assert.deepEqual(got.result.events[0], { type: 'deep', truncated: true });
+      assert.deepEqual(got.result.events.slice(1).map((e) => e.type), harness === 'codex' ? ['thread.started', 'item.started', 'turn.completed'] : ['system', 'result', 'result']);
+    }
+    assert.equal((await w.a.harnesses()).harnesses.length, 3, 'the service still answers');
+  } finally { await w.close(); }
+});
+
 test('main: a client entry whose webSearch or events is not true or false stops the service at start', BOX, () => {
   const root = mkdtempSync(join(tmpdir(), 'hb-service-clients-'));
   try {
@@ -344,7 +361,7 @@ async function fakeWorld({ events = [], limits = {} } = {}) {
     run: async (scoped, h, o) => {
       calls.push({ scoped, h, ...o });
       o.onStart();
-      for (const e of events) o.onEvent(e, { stage: '' });
+      for (const e of typeof events === 'function' ? events() : events) o.onEvent(e, { stage: '' });
       return { ...FAKE_RESULT };
     },
     exec: async () => ({ code: 0, out: '{}', why: null }),
@@ -444,4 +461,38 @@ test('service: kept events count against the ended runs\' memory cap', async () 
     await assert.rejects(w.c.getRun(first), { status: 404, code: 'unknown_run' }, 'two runs of kept events pass 5000 bytes: the oldest ended runs go');
     assert.equal((await w.c.getRun(second)).result.events.length, 30);
   } finally { w.close(); }
+});
+
+// {"type":"deep","a":{"a":…1…}} nested n objects under the top one: n + 1 deep, parsed the way the runner parses a line
+const deepEvent = (n) => JSON.parse(`{"type":"deep","a":${'{"a":'.repeat(n)}1${'}'.repeat(n)}}`);
+test('service: an event nested past the stack or past eventDepth is kept as { type, truncated }, and the end, GET and the service go on', async () => {
+  const w = await fakeWorld({ events: () => [{ type: 'a' }, deepEvent(4073), deepEvent(5000), deepEvent(100000), deepEvent(63), deepEvent(64), { type: 'z' }] });
+  try {
+    const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id;
+    const ended = await w.c.events(id), got = await w.c.getRun(id);
+    assert.deepEqual(ended, got);
+    const cut = { type: 'deep', truncated: true };
+    assert.deepEqual(got.result.events, [{ type: 'a' }, cut, cut, cut, deepEvent(63), cut, { type: 'z' }], '64 deep is kept, 65 is not');
+    assert.equal(got.result.eventsTruncated, false);
+    assert.equal(got.events, 7);
+    assert.equal((await w.c.harnesses()).harnesses.length, 3, 'the service still answers');
+  } finally { w.close(); }
+});
+
+test('service: eventsCount keeps exactly that many events; one more marks eventsTruncated; many small objects', async () => {
+  for (const [n, kept, truncated] of [[5, 5, false], [6, 5, true]]) {
+    const w = await fakeWorld({ events: Array.from({ length: n }, (_, i) => ({ type: 't', i })), limits: { eventsCount: 5 } });
+    try {
+      const r = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id);
+      assert.deepEqual([r.result.events.length, r.result.eventsTruncated, r.events], [kept, truncated, n], `${n} events`);
+      assert.deepEqual(r.result.events.at(-1), { type: 't', i: kept - 1 });
+    } finally { w.close(); }
+  }
+  for (const [n, truncated] of [[2000, false], [2001, true], [50000, true]]) {
+    const w = await fakeWorld({ events: () => Array.from({ length: n }, () => ({})) });
+    try {
+      const r = await w.c.getRun((await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id)).id);
+      assert.deepEqual([r.result.events.length, r.result.eventsTruncated], [2000, truncated], `${n} small events: the default 2000`);
+    } finally { w.close(); }
+  }
 });
