@@ -22,14 +22,22 @@ const result: RunResult = await runner.run('alice', 'custom', {
   prompt: 'hello', dir: '/jobs/1', signal: new AbortController().signal,
   onEvent: async (event, { stage }) => { if (event.type === 'end') console.log(event, stage); },
   roBinds: [['/validator', '/jobs/1/validator'] as const],
-  boxDir: '/work', model: 'sonnet', onStart: () => {},
+  boxDir: '/work', model: 'sonnet', onStart: () => {}, webSearch: true,
 });
+const searches: boolean = (await runner.detect())[0].webSearch;
+void searches;
 await runner.exec('alice/u1', 'custom', ['true'], { dir: '/jobs/1', boxDir: '/work', home: '/tmp/empty', signal: new AbortController().signal });
 const hb = harnessbox({ socketPath: '/run/harnessbox/hb.sock', token: 't' });
 const started: Run = await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', files: [{ path: 'a.jpg', base64: '', copies: ['out/a.jpg'] }], outputs: ['out/x'], validate: { argv: ['true'] } });
 const ended: Run = await hb.events(started.id, (event, run) => { if (event === 'progress') console.log(run.stage); });
 const draft: string | null | undefined = ended.outputs?.['out/x'];
 void draft;
+const searched: Run = await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', webSearch: true, events: true });
+const kept: Record<string, any>[] | undefined = searched.result?.events;
+const cut: boolean | undefined = searched.result?.eventsTruncated;
+void kept; void cut;
+// @ts-expect-error events is true or false
+hb.run({ user: 'u1', harness: 'codex', prompt: 'x', events: 'all' });
 const hbError: Error = new HarnessboxError(409, 'busy');
 void hbError;
 // @ts-expect-error validators never get a network

@@ -1,6 +1,7 @@
 // The service end to end: src/server.mjs on a unix socket, driven through src/client.mjs, over the real runner with real bubblewrap
 // boxes and the fake CLIs (test/fake-cli.mjs). Two clients, their users kept apart; auth; logins; a review-automation-shaped draft
-// job (files in, a read-only skill, out/ files back, a validator in a no-network box); cancel; caps; a restart.
+// job (files in, a read-only skill, out/ files back, a validator in a no-network box); cancel; caps; a restart. webSearch and events
+// per client; the tests over a stand-in runner (fakeWorld) need no bubblewrap.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -17,7 +18,7 @@ const HERE = import.meta.dirname;
 const FAKE = { 'claude-code': join(HERE, 'fake-claude'), codex: join(HERE, 'fake-codex'), grok: join(HERE, 'fake-grok') };
 const canBox = spawnSync('bwrap', ['--unshare-all', '--die-with-parent', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc', '--dev', '/dev', '/usr/bin/true']).status === 0;
 const BOX = { skip: !canBox && 'needs bubblewrap with user namespaces' };
-const TOKEN = { a: 'token-of-client-a-0123456789', b: 'token-of-client-b-0123456789' };
+const TOKEN = { a: 'token-of-client-a-0123456789', b: 'token-of-client-b-0123456789', c: 'token-of-client-c-0123456789' };
 const hex = (t) => createHash('sha256').update(t).digest('hex');
 const CRED = { 'claude-code': '.claude/.credentials.json', codex: '.codex/auth.json', grok: '.grok/auth.json' };
 const b64 = (s) => Buffer.from(s).toString('base64'), unb64 = (s) => (s === null ? null : Buffer.from(s, 'base64').toString());
@@ -28,11 +29,11 @@ async function world({ limits = {}, root = mkdtempSync(join(tmpdir(), 'hb-servic
   mkdirSync(runs, { recursive: true });
   const hb = await createRunner({ homes, adapters: [claudeCode, codex, grok], bins: FAKE, socat: join(HERE, 'fake-socat'), log: (l) => logs.push(l), passEnv: env });
   const svc = createService({ hb, harnesses: await hb.detect(), runs, log: (l) => logs.push(l), limits, models: { codex: ['gpt-5.5-codex'] },
-    clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appb', tokenSha256: hex(TOKEN.b), harnesses: ['claude-code'] }] });
+    clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appb', tokenSha256: hex(TOKEN.b), harnesses: ['claude-code'] }, { id: 'appc', tokenSha256: hex(TOKEN.c), webSearch: true, events: true }] });
   await new Promise((r) => svc.server.listen(sock, r));
   const logIn = (client, user, id) => { const f = join(homes, client, user, id, CRED[id]); mkdirSync(join(f, '..'), { recursive: true }); writeFileSync(f, '{"fake":true}'); };
   return {
-    root, homes, runs, sock, logs, logIn, a: harnessbox({ socketPath: sock, token: TOKEN.a }), b: harnessbox({ socketPath: sock, token: TOKEN.b }),
+    root, homes, runs, sock, logs, logIn, a: harnessbox({ socketPath: sock, token: TOKEN.a }), b: harnessbox({ socketPath: sock, token: TOKEN.b }), c: harnessbox({ socketPath: sock, token: TOKEN.c }),
     close: async ({ keep = false } = {}) => { svc.close(); await hb.close(); if (!keep) rmSync(root, { recursive: true, force: true }); },
   };
 }
@@ -84,6 +85,7 @@ test('service: auth, harness lists per client, logins through the API, status an
   } finally { await w.close(); }
 });
 
+const RESULT_020 = ['code', 'text', 'usage', 'error', 'stderr', 'why', 'timedOut', 'canceled'];
 const draftJob = (user, harness, more = {}) => ({
   user, harness, prompt: `Read ${BOX_DIR}/request.md. FAKE_MODE=rva`, model: undefined,
   files: [{ path: 'request.md', text: '# request\n' }, { path: 'materials/photos/p1.jpg', base64: b64('\xff\xd8 not really a jpeg'), copies: ['out/photos/p1.jpg'] }, { path: 'materials/memo.txt', text: '메모' },
@@ -107,6 +109,7 @@ test('service: a review-automation-shaped draft job per harness: files in, read-
       assert.ok(seen.includes('state:running') && seen.at(-1) === 'end:done', seen.join(' '));
       assert.equal(r.result.code, 0);
       assert.equal(r.result.text, 'done (rva)');
+      assert.deepEqual(Object.keys(r.result), RESULT_020, 'a client without webSearch and events gets the 0.2.0 result');
       assert.ok(r.events > 0 && r.stage);
       const draft = JSON.parse(unb64(r.outputs['out/draft.json']));
       assert.deepEqual(draft.files, ['memo.txt', 'photos', 'photos/p1.jpg']);
@@ -217,6 +220,48 @@ test('main: configured from the environment, a 0666 socket, stale run folders re
   assert.equal(child.signalCode, 'SIGTERM', out);
 });
 
+test('service: a client allowed webSearch and events gets the CLI\'s events through the real runner, a search-enabled command, and capped events', BOX, async () => {
+  const w = await world({ limits: { eventBytes: 1000, eventsBytes: 1000 } });
+  try {
+    for (const id of ['claude-code', 'codex']) w.logIn('appc', 'u1', id);
+    const c = await w.c.events((await w.c.run({ user: 'u1', harness: 'claude-code', prompt: 'x', webSearch: true, events: true, outputs: ['seen.json'] })).id);
+    assert.equal(c.state, 'done');
+    // the fake's events as it printed them; the line cut in the middle is not JSON and is skipped
+    assert.deepEqual(c.result.events.map((e) => [e.type, e.subtype ?? e.result]), [['system', 'init'], ['result', 'first turn'], ['result', 'done (ok)']]);
+    assert.deepEqual(c.result.events[0], { type: 'system', subtype: 'init', session_id: 's1', model: 'claude-sonnet-5-5' });
+    assert.equal(c.result.eventsTruncated, false);
+    assert.equal(c.events, 3);
+    const args = JSON.parse(unb64(c.outputs['seen.json'])).args;
+    assert.ok(args.includes('--allowedTools') && args.filter((a) => a === 'WebSearch').length === 1 && args.includes('WebFetch'));
+    const x = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', webSearch: true, events: true, outputs: ['seen.json'] })).id);
+    assert.deepEqual(x.result.events.map((e) => e.type), ['thread.started', 'item.started', 'turn.completed']);
+    assert.ok(JSON.parse(unb64(x.outputs['seen.json'])).args.includes('web_search=live'));
+    // 64 events of 32 KiB each: every one over eventBytes, kept as { type, truncated } until eventsBytes is reached
+    const f = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'FAKE_MODE=flood', events: true })).id);
+    assert.equal(f.state, 'done');
+    assert.deepEqual(f.result.events[0], { type: 'text', truncated: true });
+    assert.equal(f.result.events.length, 30, '30 of 33 bytes each fit in 1000');
+    assert.equal(f.result.eventsTruncated, true);
+    assert.equal(f.events, 64);
+    // the same client without the fields: the 0.2.0 result
+    const plain = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x' })).id);
+    assert.deepEqual(Object.keys(plain.result), RESULT_020);
+  } finally { await w.close(); }
+});
+
+test('main: a client entry whose webSearch or events is not true or false stops the service at start', BOX, () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-service-clients-'));
+  try {
+    writeFileSync(join(root, 'clients.json'), JSON.stringify({ clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a), events: 'yes' }] }));
+    const r = spawnSync(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { encoding: 'utf8', timeout: 30e3, env: {
+      PATH: process.env.PATH, HB_LISTEN: join(root, 'hb.sock'), HB_CLIENTS: join(root, 'clients.json'), HB_HOMES: join(root, 'homes'), HB_RUNS: join(root, 'runs'), HB_HARNESSES: 'codex',
+      HB_BIN_CODEX: FAKE.codex, HB_SOCAT: join(HERE, 'fake-socat') } });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /bad client entry appa: events must be true or false/);
+    assert.ok(!existsSync(join(root, 'hb.sock')), 'it never listened');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('main: a bad HB_MAX_OUTPUT_BYTES stops the service at start', async () => {
   for (const value of ['0', '-1', '1.5', '8MiB', '']) {
     const r = spawnSync(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { encoding: 'utf8', timeout: 30e3,
@@ -286,4 +331,117 @@ test('service: file copies count against the file-count limit', BOX, async () =>
     await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: 'a', text: 'x', copies: ['b'] }] }), { status: 400, code: 'bad_files' });
     assert.deepEqual(readdirSync(w.runs), []);
   } finally { await w.close(); }
+});
+
+// ---- webSearch and events over a stand-in runner: what the service checks, passes on and keeps, without a box
+const ROWS = [{ id: 'claude-code', name: 'Claude Code', version: '2.1.300', usable: true, why: null, webSearch: true },
+  { id: 'codex', name: 'Codex', version: '0.162.1', usable: true, why: null, webSearch: true }, { id: 'grok', name: 'Grok', version: '1.0.52', usable: true, why: null, webSearch: false }];
+const FAKE_RESULT = { code: 0, text: 'done', usage: { input: 1, output: 2 }, error: '', stderr: '', why: null, timedOut: false, canceled: false };
+async function fakeWorld({ events = [], limits = {} } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'hb-fake-svc-')), runs = join(root, 'runs'), sock = join(root, 'hb.sock'), calls = [];
+  mkdirSync(runs);
+  const hb = {
+    run: async (scoped, h, o) => {
+      calls.push({ scoped, h, ...o });
+      o.onStart();
+      for (const e of events) o.onEvent(e, { stage: '' });
+      return { ...FAKE_RESULT };
+    },
+    exec: async () => ({ code: 0, out: '{}', why: null }),
+  };
+  const svc = createService({ hb, harnesses: ROWS, runs, limits,
+    clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appc', tokenSha256: hex(TOKEN.c), webSearch: true, events: true }] });
+  await new Promise((r) => svc.server.listen(sock, r));
+  return { runs, calls, a: harnessbox({ socketPath: sock, token: TOKEN.a }), c: harnessbox({ socketPath: sock, token: TOKEN.c }),
+    close: () => { svc.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+
+test('service: a client entry\'s webSearch and events must be true or false, else the service does not start', () => {
+  for (const k of ['webSearch', 'events']) {
+    for (const bad of ['true', 1, null, {}]) {
+      assert.throws(() => createService({ hb: {}, harnesses: ROWS, runs: tmpdir(), clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a), [k]: bad }] }),
+        new RegExp(`bad client entry appa: ${k} must be true or false`), `${k}: ${JSON.stringify(bad)}`);
+    }
+    for (const ok of [true, false]) assert.ok(createService({ hb: {}, harnesses: ROWS, runs: tmpdir(), clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a), [k]: ok }] }).server);
+  }
+});
+
+test('service: webSearch and events are refused unless the client\'s entry allows them, and webSearch where the harness has none', async () => {
+  const w = await fakeWorld();
+  try {
+    const run = { user: 'u1', harness: 'codex', prompt: 'x' };
+    await assert.rejects(w.a.run({ ...run, webSearch: true }), { status: 400, code: 'web_search_not_allowed' });
+    await assert.rejects(w.a.run({ ...run, events: true }), { status: 400, code: 'events_not_allowed' });
+    await assert.rejects(w.c.run({ ...run, harness: 'grok', webSearch: true }), { status: 400, code: 'web_search_unsupported', message: 'Grok does not support webSearch on this service' });
+    for (const k of ['webSearch', 'events']) for (const bad of ['true', 1, {}]) await assert.rejects(w.c.run({ ...run, [k]: bad }), { status: 400, code: 'bad_request' }, `${k}: ${JSON.stringify(bad)}`);
+    assert.equal(w.calls.length, 0, 'a refused run never reaches the runner');
+    assert.deepEqual(readdirSync(w.runs), [], 'and leaves no folder');
+    // false is allowed everywhere, as is a Grok run without webSearch at a client that may search
+    for (const [hb, body] of [[w.a, { ...run, webSearch: false, events: false }], [w.c, { ...run, harness: 'grok' }]]) assert.equal((await hb.events((await hb.run(body)).id)).state, 'done');
+  } finally { w.close(); }
+});
+
+test('service: without webSearch and events a run reaches the runner and comes back as before; with webSearch the runner is told', async () => {
+  const w = await fakeWorld({ events: [{ type: 'thread.started' }, { type: 'turn.completed', usage: { input_tokens: 1 } }] });
+  try {
+    for (const [hb, more] of [[w.a, {}], [w.a, { webSearch: false, events: false }], [w.c, {}], [w.c, { events: false }]]) {
+      const id = (await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', ...more })).id;
+      const ended = await hb.events(id), got = await hb.getRun(id);
+      assert.deepEqual(ended.result, FAKE_RESULT, JSON.stringify(more));
+      assert.deepEqual(got, ended);
+      assert.deepEqual(Object.keys(got.result), RESULT_020);
+      assert.equal(got.events, 2, 'the event count is still there');
+      assert.equal(w.calls.at(-1).webSearch, false);
+    }
+    await w.c.events((await w.c.run({ user: 'u1', harness: 'claude-code', prompt: 'x', webSearch: true })).id);
+    assert.equal(w.calls.at(-1).webSearch, true);
+  } finally { w.close(); }
+});
+
+test('service: events: true keeps the CLI\'s events in result.events, an oversized one as { type, truncated }, the first eventsBytes in total; GET and the end event agree', async () => {
+  const small = (i) => ({ type: 'item.completed', item: { type: 'web_search', id: `ws_${i}`, query: `q${i}`, url: `https://example.com/${i}` } });
+  const big = { type: 'item.completed', item: { type: 'command_execution', aggregated_output: 'x'.repeat(500) } }, untyped = { data: 'y'.repeat(500) };
+  const events = [small(0), big, untyped, ...Array.from({ length: 40 }, (_, i) => small(i + 1))];
+  const limits = { eventBytes: 300, eventsBytes: 1500 };
+  // the expected prefix: each kept event costs its JSON bytes plus one
+  const expect = [];
+  let bytes = 0;
+  for (const e of events) {
+    const item = Buffer.byteLength(JSON.stringify(e)) > limits.eventBytes ? { type: typeof e.type === 'string' ? e.type : null, truncated: true } : e;
+    if (bytes + Buffer.byteLength(JSON.stringify(item)) + 1 > limits.eventsBytes) break;
+    bytes += Buffer.byteLength(JSON.stringify(item)) + 1;
+    expect.push(item);
+  }
+  assert.ok(expect.length > 3 && expect.length < events.length, 'the limits cut the list');
+  const w = await fakeWorld({ events, limits });
+  try {
+    const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id;
+    const ended = await w.c.events(id), got = await w.c.getRun(id);
+    assert.deepEqual(ended, got, 'the end event and GET give the same run');
+    assert.deepEqual(got.result, { ...FAKE_RESULT, events: expect, eventsTruncated: true });
+    assert.deepEqual(got.result.events.slice(0, 3), [small(0), { type: 'item.completed', truncated: true }, { type: null, truncated: true }]);
+    assert.ok(JSON.stringify(got.result.events).length <= limits.eventsBytes + 1);
+    assert.equal(got.events, events.length, 'the count covers every event, kept or not');
+  } finally { w.close(); }
+  // under the caps: every event, eventsTruncated false
+  const few = await fakeWorld({ events: [small(1), small(2)] });
+  try {
+    const r = await few.c.events((await few.c.run({ user: 'u1', harness: 'claude-code', prompt: 'x', events: true })).id);
+    assert.deepEqual(r.result, { ...FAKE_RESULT, events: [small(1), small(2)], eventsTruncated: false });
+  } finally { few.close(); }
+});
+
+test('service: kept events count against the ended runs\' memory cap', async () => {
+  const events = Array.from({ length: 30 }, (_, i) => ({ type: 'text', data: `${i}`.padEnd(90, '.') })); // about 3000 bytes kept
+  const w = await fakeWorld({ events, limits: { keptBytes: 5000 } });
+  try {
+    const run = async (hb, more) => { const id = (await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', ...more })).id; await hb.events(id); return id; };
+    const plain = [await run(w.c, {}), await run(w.c, {})];
+    for (const id of plain) assert.equal((await w.c.getRun(id)).state, 'done', 'runs without events stay well under the cap');
+    const first = await run(w.c, { events: true }), second = await run(w.c, { events: true });
+    // the accounting follows the end (after the run folder is removed): wait for it
+    for (let i = 0; i < 50 && (await w.c.getRun(first).then(() => true, () => false)); i++) await sleep(20);
+    await assert.rejects(w.c.getRun(first), { status: 404, code: 'unknown_run' }, 'two runs of kept events pass 5000 bytes: the oldest ended runs go');
+    assert.equal((await w.c.getRun(second)).result.events.length, 30);
+  } finally { w.close(); }
 });

@@ -39,7 +39,7 @@ export function harnessbox({ socketPath, url, token }) {
     cancelLogin: (user, h) => call('DELETE', `${u(user, h)}/login`),
     logout: (user, h) => call('POST', `${u(user, h)}/logout`),
     purge: (user) => call('DELETE', `/v1/users/${encodeURIComponent(user)}`),
-    /** body: { user, harness, prompt, model?, files: [{ path, base64 | text }], readonly?, outputs?, validate?, timeoutMs?, args? } */
+    /** body: { user, harness, prompt, model?, files: [{ path, base64 | text }], readonly?, outputs?, validate?, timeoutMs?, args?, webSearch?, events? } */
     run: (body) => call('POST', '/v1/runs', body),
     getRun: (id) => call('GET', `/v1/runs/${encodeURIComponent(id)}`),
     cancelRun: (id) => call('DELETE', `/v1/runs/${encodeURIComponent(id)}`),
