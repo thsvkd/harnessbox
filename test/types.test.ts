@@ -36,6 +36,8 @@ const searched: Run = await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', 
 const kept: Record<string, any>[] | undefined = searched.result?.events;
 const cut: boolean | undefined = searched.result?.eventsTruncated;
 void kept; void cut;
+const canSearch: boolean = (await hb.harnesses()).harnesses[0].webSearch;
+void canSearch;
 // @ts-expect-error events is true or false
 hb.run({ user: 'u1', harness: 'codex', prompt: 'x', events: 'all' });
 const hbError: Error = new HarnessboxError(409, 'busy');

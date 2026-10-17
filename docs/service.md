@@ -40,7 +40,7 @@ large), 429 (too many runs or logins). `:user` is `[A-Za-z0-9_-]{1,64}`, your ow
 
 | Request | Answer |
 |---|---|
-| `GET /v1/harnesses` | `{ harnesses: [{ id, name, version, usable, why }] }`: what this client may use, as `detect()` found it at start. |
+| `GET /v1/harnesses` | `{ harnesses: [{ id, name, version, usable, why, webSearch }] }`: what this client may use, as `detect()` found it at start. `webSearch`: the harness supports it (whether this client may ask for it is its entry's `webSearch`). |
 | `GET /v1/users/:user/harnesses` | `{ harnesses: [{ harness, installed, loggedIn, method, plan, checkedAt } \| { harness, busy: true, …last known } \| { harness, error }] }`: each usable harness, one after another. |
 | `GET /v1/users/:user/harnesses/:h` | `{ harness, installed, loggedIn, method, plan, checkedAt }`: a status at most 30 s old, else asked in a box; 409 `busy` when it would have to ask while that user's login or run of `:h` holds the box. |
 | `POST /v1/users/:user/harnesses/:h/login` | Starts the CLI's own login in the user's box and waits up to 30 s for its URL: `{ state, url, code, needsCode, startedAt, expiresAt }`. A newer login for the same user and harness replaces the old one. |

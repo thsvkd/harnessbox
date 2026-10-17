@@ -17,7 +17,8 @@
   without the fields are unchanged.
 - Service: a client without `webSearch` may not name web search in `args` (400 `web_search_not_allowed`): Codex's later
   `-c web_search=live` overrode the adapter's `web_search=disabled`, in 0.2.0 too. Other options in `args` still widen the CLI.
-- `harnessbox/client`: types for `webSearch`, `events`, `result.events`, `result.eventsTruncated`.
+- Service: `GET /v1/harnesses` rows carry `webSearch` (the adapter supports it).
+- `harnessbox/client`: types for `webSearch`, `events`, `result.events`, `result.eventsTruncated` and the harness list's `webSearch`.
 
 ## 0.2.0
 

@@ -31,7 +31,8 @@ export interface Run {
   outputs?: Record<string, string | null> | null;
 }
 export interface Harnessbox {
-  harnesses(): Promise<{ harnesses: { id: string; name: string; version: string | null; usable: boolean; why: string | null }[] }>;
+  /** webSearch: the harness's adapter supports webSearch (whether this client may use it is its entry's webSearch). */
+  harnesses(): Promise<{ harnesses: { id: string; name: string; version: string | null; usable: boolean; why: string | null; webSearch: boolean }[] }>;
   statuses(user: string): Promise<{ harnesses: HarnessStatus[] }>;
   status(user: string, harness: string): Promise<HarnessStatus>;
   login(user: string, harness: string): Promise<LoginView>;

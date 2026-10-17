@@ -318,7 +318,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   async function route(req, res) {
     const c = auth(req), url = new URL(req.url, 'http://x'), m = req.method, p = url.pathname.split('/').slice(1).map(decodeURIComponent);
     if (p[0] !== 'v1') no(404, 'not_found', 'not found');
-    if (m === 'GET' && p.length === 2 && p[1] === 'harnesses') return json(res, 200, { harnesses: allowed(c).map(({ id, name, version, usable, why }) => ({ id, name, version, usable, why })) });
+    if (m === 'GET' && p.length === 2 && p[1] === 'harnesses') return json(res, 200, { harnesses: allowed(c).map(({ id, name, version, usable, why, webSearch }) => ({ id, name, version, usable, why, webSearch: webSearch === true })) });
     if (p[1] === 'users' && p.length >= 3) {
       const scoped = userOf(c, p[2]);
       if (p.length === 3 && m === 'DELETE') {

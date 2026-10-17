@@ -48,7 +48,7 @@ test('service: auth, harness lists per client, logins through the API, status an
   try {
     assert.equal((await raw(w.sock, 'GET', '/v1/harnesses')).status, 401);
     assert.equal((await raw(w.sock, 'GET', '/v1/harnesses', { authorization: 'Bearer not-a-real-token-at-all' })).status, 401);
-    assert.deepEqual((await w.a.harnesses()).harnesses.map((h) => [h.id, h.usable]), [['claude-code', true], ['codex', true], ['grok', true]]);
+    assert.deepEqual((await w.a.harnesses()).harnesses.map((h) => [h.id, h.usable, h.webSearch]), [['claude-code', true, true], ['codex', true, true], ['grok', true, false]]);
     assert.deepEqual((await w.b.harnesses()).harnesses.map((h) => h.id), ['claude-code'], 'a client sees only its harnesses');
     await assert.rejects(w.b.status('u1', 'codex'), { status: 404, code: 'unknown_harness' });
     await assert.rejects(w.a.status('../x', 'codex'), { status: 400, code: 'bad_user' });
@@ -460,6 +460,15 @@ test('service: kept events count against the ended runs\' memory cap', async () 
     for (let i = 0; i < 50 && (await w.c.getRun(first).then(() => true, () => false)); i++) await sleep(20);
     await assert.rejects(w.c.getRun(first), { status: 404, code: 'unknown_run' }, 'two runs of kept events pass 5000 bytes: the oldest ended runs go');
     assert.equal((await w.c.getRun(second)).result.events.length, 30);
+  } finally { w.close(); }
+});
+
+test('service: GET /v1/harnesses says which harnesses support webSearch, the other fields as before', async () => {
+  const w = await fakeWorld();
+  try {
+    const list = (await w.a.harnesses()).harnesses;
+    assert.deepEqual(list.map((h) => Object.keys(h)), ROWS.map(() => ['id', 'name', 'version', 'usable', 'why', 'webSearch']));
+    assert.deepEqual(list.map((h) => [h.id, h.webSearch]), [['claude-code', true], ['codex', true], ['grok', false]]);
   } finally { w.close(); }
 });
 
