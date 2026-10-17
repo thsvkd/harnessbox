@@ -9,7 +9,7 @@ Use it as a library in your own runner process (below), or run it as a **service
 each app with its own token and its own users (`node src/server.mjs`, the image's default command; [docs/service.md](docs/service.md)).
 
 Extracted on 2026-10-16 from review-automation's per-user runner (`app/runner/box.mjs`, `rva-runner.mjs`), deployed there for
-Claude Code and Codex. Node 24, Linux (arm64 or x64), bubblewrap, socat; no runtime npm dependencies. Version 0.1.1.
+Claude Code and Codex. Node 24, Linux (arm64 or x64), bubblewrap, socat; no runtime npm dependencies. Version 0.3.0.
 Install the package tarball from this repository's release, or use a Git dependency. TypeScript declarations and the deployment
 probe are included. The package is not published to the public npm registry.
 TypeScript consumers need `@types/node` in their development dependencies.
@@ -42,6 +42,7 @@ const r = await hb.run('u_alice', 'claude-code', {
   args: ['--allowedTools', `Read(/${jobDir}/**)`, `Edit(/${jobDir}/out/**)`], // the caller's tool rules
 });
 // r: { code, text, usage: { input, output[, unknown] }, error, stderr, why, timedOut, canceled, loggedIn? }
+// webSearch: true turns on the CLI's own server-side search (Claude Code, Codex; the box's hosts stay the same)
 const draft = await readOut(jobDir, 'out/summary.md'); // never readFile on what a box wrote; jobDir must be a real path
 await hb.exec('u_alice', 'claude-code', ['python3', '-I', '/opt/v/validate.py', `${jobDir}/out/x.json`], { dir: jobDir, roBinds: ['/opt/v'] }); // no network
 await hb.logout('u_alice', 'grok');
@@ -91,6 +92,7 @@ runner data or exiting. Queued jobs settle as canceled; other pending operations
 | Credential kept | `.claude/.credentials.json`, `.claude.json` (account keys only) | `.codex/auth.json` (forced file store) | `.grok/auth.json` |
 | Box hosts | api.anthropic.com, platform.claude.com | auth.openai.com, chatgpt.com | auth.x.ai, cli-chat-proxy.grok.com, api.x.ai |
 | Job | `-p`, stream-json, dontAsk, `--restricted`, `--strict-mcp-config`, no session persistence, no web tools | `exec --json`, `--ignore-user-config`, workspace-write sandbox without network/MCP/apps/plugins/web search | `-p`, streaming-json, web search off |
+| `run({ webSearch: true })` | `WebSearch` allowed (`--allowedTools WebSearch`, out of `--disallowedTools`); WebFetch and MCP still denied | `-c web_search=live` instead of `web_search=disabled`; sandbox network still off | not supported (refused) |
 | Nested userns | no | yes (its own sandbox) | no (its sandbox stays off) |
 
 What was verified (2026-10-16, this repository's code, Raspberry Pi 5, kernel 6.18, bwrap 0.11.0):

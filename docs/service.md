@@ -11,7 +11,7 @@ with the same user ids. `src/client.mjs` is a dependency-free client: import it 
 | Variable | Default | |
 |---|---|---|
 | `HB_LISTEN` | `/run/harnessbox/hb.sock` | A unix socket path (made 0666; its folder is the boundary), or `host:port` for TCP on a private network. A socket path must stay under 108 bytes. |
-| `HB_CLIENTS` | `/etc/harnessbox/clients.json` | `{"clients":[{"id":"myapp","tokenSha256":"<hex>","harnesses":["claude-code"]}]}`. `harnesses` is optional (default: all). Read at start; restart to rotate. Make a token with `openssl rand -base64 32`, its hash with `printf %s "$TOKEN" \| sha256sum`. |
+| `HB_CLIENTS` | `/etc/harnessbox/clients.json` | `{"clients":[{"id":"myapp","tokenSha256":"<hex>","harnesses":["claude-code"]}]}`. `harnesses` is optional (default: all). `"webSearch": true` and `"events": true` (default false) let that client's runs ask for them (below); a value that is not `true` or `false` stops the service at start. Read at start; restart to rotate. Make a token with `openssl rand -base64 32`, its hash with `printf %s "$TOKEN" \| sha256sum`. |
 | `HB_HOMES` | `/homes` | Users' homes. |
 | `HB_RUNS` | `/tmp/hb-runs` | Run folders (put it on a tmpfs). Emptied at start. |
 | `HB_HARNESSES` | `claude-code,codex,grok` | Which adapters to load. |
@@ -24,8 +24,8 @@ with the same user ids. `src/client.mjs` is a dependency-free client: import it 
 | `HB_BWRAP`, `HB_SOCAT` | on PATH | |
 
 Fixed limits (`LIMITS` in `src/server.mjs`): prompt 256 KiB; 2000 files, 48 MiB decoded; 32 outputs, 2 MiB each, 16 MiB together;
-16 active runs and 200 kept runs per client; 256 MiB of ended runs' outputs for everybody (past it the oldest ended runs are
-forgotten early); 128 MiB of request bodies in flight and 32 event streams per client; 4 waiting logins per client; run time
+16 active runs and 200 kept runs per client; 256 MiB of ended runs' outputs (with their kept events) for everybody (past it the
+oldest ended runs are forgotten early); kept events 1 MiB per run, 64 KiB per event; 128 MiB of request bodies in flight and 32 event streams per client; 4 waiting logins per client; run time
 1 s–2 h (default 40 min); validator 1 s–10 min (default 60 s); runs and ended logins are kept 30 minutes; a status is cached 30 s.
 
 ## API v1
@@ -80,6 +80,16 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
   user's: it never sees their credential), after the CLI exited 0 or ran out of time (not after a failure or a cancel).
 - `model`: passed as `--model` (all three CLIs). `args`: extra CLI options after the adapter's hardened ones. They cannot widen the
   box, but they can widen what the CLI lets the model do inside it (see the threat model). `timeoutMs` stops the CLI.
+- `webSearch: true` (only for a client whose entry has `"webSearch": true`, else 400 `web_search_not_allowed`): the CLI's own
+  server-side web search. Claude Code: `WebSearch` leaves `--disallowedTools` (WebFetch and MCP tools stay denied) and gets
+  `--allowedTools WebSearch`; a `--tools` list in `args` must name `WebSearch` too. Codex: `-c web_search=live` instead of
+  `web_search=disabled`; its sandbox keeps no network. Grok: 400 `web_search_unsupported`. The search runs at Anthropic or OpenAI;
+  the box's hosts are the same (see the threat model).
+- `events: true` (only for a client whose entry has `"events": true`, else 400 `events_not_allowed`): the run's
+  `result.events` holds the CLI's stdout events, each line that parsed as a JSON object, as printed (Claude Code's stream-json,
+  Codex's `--json`, Grok's streaming-json), in order: the first 1 MiB of them (as JSON, a comma each; then `result.eventsTruncated:
+  true`), an event over 64 KiB replaced by `{ type, truncated: true }`. Their fields come from the box: validate before use.
+- `webSearch` and `events` false or absent: the run and its result are exactly as without them (no `events` in `result`).
 
 `GET /v1/runs/:id` → the run:
 
@@ -97,6 +107,8 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
   covers the CLI's own failure, a time limit (`result.timedOut`, outputs and validator still there) and the watchdog (`result.why`).
 - `result.loggedIn`: present after a CLI failure; `false` means the user must log in again.
 - `usage.unknown: true`: the CLI reported no usage. Claude's input counts cache tokens.
+- `result.events`, `result.eventsTruncated`: only for a run with `events: true`. The top-level `events` stays the count of all
+  events.
 - `error`: the service could not run it at all.
 
 `GET /v1/runs/:id/events` → Server-Sent Events: `state` (on each state change), `progress` (at most once a second while events
@@ -176,7 +188,17 @@ After every deploy: `deploy/probe.mjs` inside the service container (isolation, 
   results for credentials. Only let clients you would trust with those credentials connect, and keep the CLIs' tool rules tight.
 - **Tokens** are compared by their SHA-256; the clients file holds only hashes. Whoever can reach the socket or port and holds a
   token is that client. Keep the socket volume to the client apps and the TCP port on a private network.
-- **What the service keeps**: runs (prompts never; outputs and the CLI's last message for 30 minutes) and login sessions (URL and
-  code until 30 minutes after the end) in memory only. Logs carry ids, states and egress denials.
+- **What the service keeps**: runs (prompts never; outputs, the CLI's last message and, with `events: true`, its events for 30
+  minutes) and login sessions (URL and code until 30 minutes after the end) in memory only. Logs carry ids, states and egress denials.
+- **Events carry everything the CLI printed**, not only the last message: tool calls and their results (Codex's command output,
+  Claude Code's tool results, the pages a search returned), file contents the model read, its own paths. A command the model runs
+  (or a prompt injection in the material makes it run) that prints a file of the box, the user's credential included where the
+  tool rules let it read the home (Codex's sandbox reads the whole box), arrives in `result.events` without the model having to
+  repeat it. Allow `events` only for clients that treat runs' results as credential-bearing, and do not log them.
+- **Web search leaves the box's host list as it is, not the data where it is.** The search tools run at the model's provider
+  (Claude Code's WebSearch: Anthropic's search backend, titles and URLs, no page fetch; Codex's `web_search=live`: OpenAI's hosted
+  tool, which retrieves pages live). The box still reaches only its harness's hosts, but whatever the model puts into a query, or a
+  URL Codex's live retrieval opens, reaches the search provider and, with live retrieval, the hosts it fetches. Search results are
+  untrusted web text in the model's context (prompt injection). Allow `webSearch` only for clients whose jobs need it.
 - **Busy, not queued**: a status during that user's run or login is a 409 instead of a box; runs queue on the user's lock, so one
   user's runs never take the slots other users need.
