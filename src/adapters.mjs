@@ -37,6 +37,8 @@ const deviceCode = (t) => {
   return code ? { url, code } : null;
 };
 const n = (x) => (Number.isFinite(x) ? x : 0); // a usage number from the box, or 0
+/** s cut to at most max UTF-16 units, never between the two halves of a surrogate pair (text from the box, for a stage or an error) */
+export const clip = (s, max) => { const t = s.slice(0, max); return s.length > max && /[\ud800-\udbff]$/.test(t) ? t.slice(0, -1) : t; };
 const EXPIRED = /Login expired|Not logged in|Please run \/login|invalid_grant|token (has )?expired|401 Unauthorized/i;
 
 // ~/.claude.json keeps Claude Code's account record next to user-scope settings a box could plant (mcpServers, per-folder trust under
@@ -83,7 +85,7 @@ export const claudeCode = {
       acc.usage.input += n(u.input_tokens) + n(u.cache_creation_input_tokens) + n(u.cache_read_input_tokens);
       acc.usage.output += n(u.output_tokens);
       if (typeof e.result === 'string') acc.text = e.result;
-      if (e.is_error === true && typeof e.result === 'string') acc.error = e.result.replace(/\s+/g, ' ').trim().slice(0, 200);
+      if (e.is_error === true && typeof e.result === 'string') acc.error = clip(e.result.replace(/\s+/g, ' ').trim(), 200);
     },
   },
 };
@@ -121,9 +123,10 @@ export const codex = {
       stdin: prompt,
     }),
     event: (e, acc) => {
-      if (e.item?.type) acc.stage = CODEX_STAGE[e.item.type] ?? String(e.item.type).slice(0, 40);
+      // own keys only: an item type such as constructor or __proto__ must not read Object.prototype
+      if (e.item?.type) acc.stage = typeof e.item.type === 'string' && Object.hasOwn(CODEX_STAGE, e.item.type) ? CODEX_STAGE[e.item.type] : clip(String(e.item.type), 40);
       if (e.type === 'turn.completed' && e.usage) { acc.reports++; acc.usage.input += n(e.usage.input_tokens); acc.usage.output += n(e.usage.output_tokens); }
-      if (e.type === 'error' && typeof e.message === 'string') acc.error = e.message.slice(0, 200);
+      if (e.type === 'error' && typeof e.message === 'string') acc.error = clip(e.message, 200);
     },
     // the last message, from the file -o wrote in the job folder (readOut: never through a link the box made)
     finish: async (acc, { dir, readOut }) => { acc.text = (await readOut(dir, CODEX_LAST)) ?? acc.text; },
@@ -190,7 +193,7 @@ export const grok = {
         acc.usage.input += n(u.input_tokens) + n(u.cache_read_input_tokens) + n(u.cache_creation_input_tokens);
         acc.usage.output += n(u.output_tokens);
       }
-      if (e.type === 'error' && typeof e.message === 'string') acc.error = e.message.replace(/\s+/g, ' ').trim().slice(0, 200);
+      if (e.type === 'error' && typeof e.message === 'string') acc.error = clip(e.message.replace(/\s+/g, ' ').trim(), 200);
     },
   },
 };

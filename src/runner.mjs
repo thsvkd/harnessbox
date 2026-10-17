@@ -100,7 +100,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   const byId = new Map(adapters.map((a) => [a.id, a]));
   if (byId.size !== adapters.length) throw new Error('duplicate harness id');
   for (const a of adapters) if (!ID.test(a.id)) throw new Error(`bad harness id ${a.id}`);
-  const BIN = Object.fromEntries(await Promise.all(adapters.map(async (a) => [a.id, await which(bins[a.id] ?? a.bin)])));
+  const BIN = Object.fromEntries(await Promise.all(adapters.map(async (a) => [a.id, await which(Object.hasOwn(bins, a.id) ? bins[a.id] : a.bin)])));
   const BWRAP = await which(bwrap), SOCAT = await which(socat);
   if (!BWRAP) throw new Error(`bubblewrap binary not found: ${bwrap}`);
   if (!SOCAT) throw new Error(`socat binary not found: ${socat}`);
@@ -218,7 +218,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
         const v = await run(['--version']);
         r.version = /\d+\.\d+\.\d+/.exec(v.out)?.[0] ?? null;
         if (v.code !== 0 || !r.version) { r.why = `--version failed (exit ${v.code})`; continue; }
-        if (pins[a.id] && pins[a.id] !== r.version) { r.why = `version ${r.version}, pinned ${pins[a.id]}`; continue; }
+        if (Object.hasOwn(pins, a.id) && pins[a.id] !== r.version) { r.why = `version ${r.version}, pinned ${pins[a.id]}`; continue; }
         if (a.flags) {
           const help = (await run(a.flags.args)).out, missing = a.flags.needs.filter((f) => !help.includes(f));
           for (const f of a.flags.optional ?? []) if (help.includes(f)) r.has.add(f);

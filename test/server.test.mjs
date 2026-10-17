@@ -622,3 +622,16 @@ test('service: after the memory cap forgets runs, the heap holds about what is a
   assert.ok(m.kept < 40 && m.accounted <= 20 * 2 ** 20, JSON.stringify(m));
   assert.ok(m.heap < m.accounted * 1.5, `heap grew ${(m.heap / 2 ** 20).toFixed(1)} MiB for ${(m.accounted / 2 ** 20).toFixed(1)} MiB accounted`);
 });
+
+test('service: event and item types that are Object.prototype keys or end in half a surrogate pair stay plain strings', async () => {
+  const pad = 'x'.repeat(70000);
+  const w = await fakeWorld({ events: [{ type: `${'T'.repeat(99)}\u{1F600}`, pad }, { type: 'T'.repeat(200), pad }, { type: `${'S'.repeat(39)}\u{1F600}` }],
+    harnesses: [...ROWS, { id: 'toString', name: 'Odd', version: '1.0.0', usable: true, why: null, webSearch: false }] });
+  try {
+    const r = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id);
+    assert.deepEqual(r.result.events.slice(0, 2), [{ type: 'T'.repeat(99), truncated: true }, { type: 'T'.repeat(100), truncated: true }], 'never half a pair');
+    assert.equal(r.stage, 'S'.repeat(39));
+    // a harness id that is an Object.prototype key, with no models configured: any well-formed model, not a 500
+    assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'toString', prompt: 'x', model: 'm1' })).id)).state, 'done');
+  } finally { w.close(); }
+});

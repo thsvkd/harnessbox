@@ -21,6 +21,9 @@
   the CLI.
 - Service: a forgotten ended run (memory cap, run cap, keepMs) clears its expiry timer and drops its events, outputs and result,
   so the 30-minute timer no longer keeps every forgotten run in memory.
+- Adapters: Codex's stage reads its item-type table by own keys only (`constructor`, `__proto__` and the like are plain stages);
+  stages, error texts and a truncated event's type are cut on a code point boundary. The service's `models` and the runner's
+  `bins` and `pins` are read by own keys.
 - Service: `GET /v1/harnesses` rows carry `webSearch` (the adapter supports it).
 - `harnessbox/client`: types for `webSearch`, `events`, `result.events`, `result.eventsTruncated` and the harness list's `webSearch`.
 

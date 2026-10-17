@@ -8,7 +8,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { dirname, join } from 'node:path';
-import { claudeCode, codex, grok } from './adapters.mjs';
+import { claudeCode, clip, codex, grok } from './adapters.mjs';
 import { ID, readOutBytes } from './box.mjs';
 import { Busy, createRunner } from './runner.mjs';
 
@@ -144,7 +144,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     if (!b || typeof b !== 'object') no(400, 'bad_request', 'a JSON object is required');
     const scoped = userOf(c, b.user), h = harnessOf(c, b.harness).id;
     if (typeof b.prompt !== 'string' || !b.prompt || b.prompt.startsWith('-') || b.prompt.includes('\0') || Buffer.byteLength(b.prompt) > L.prompt) no(400, 'bad_prompt', `prompt: a string of at most ${L.prompt} bytes, not starting with "-"`);
-    if (b.model != null && (typeof b.model !== 'string' || !MODEL.test(b.model) || (models[h] && !models[h].includes(b.model)))) no(400, 'bad_model', `model not allowed for ${h}`);
+    if (b.model != null && (typeof b.model !== 'string' || !MODEL.test(b.model) || (Object.hasOwn(models, h) && !models[h].includes(b.model)))) no(400, 'bad_model', `model not allowed for ${h}`);
     const timeoutMs = b.timeoutMs ?? 40 * 60e3;
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > L.runTimeoutMs) no(400, 'bad_timeout', `timeoutMs: 1000..${L.runTimeoutMs}`);
     // webSearch and events: off unless the client's entry allows them; false or absent is the run as before
@@ -231,7 +231,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     if (k.truncated) return;
     let t = null;
     try { t = JSON.stringify(e); } catch { /* too deep for this stack */ }
-    if (typeof t !== 'string' || Buffer.byteLength(t) > L.eventBytes || depth(t) > L.eventDepth) t = JSON.stringify({ type: typeof e.type === 'string' ? e.type.slice(0, 100) : null, truncated: true });
+    if (typeof t !== 'string' || Buffer.byteLength(t) > L.eventBytes || depth(t) > L.eventDepth) t = JSON.stringify({ type: typeof e.type === 'string' ? clip(e.type, 100) : null, truncated: true });
     const size = Buffer.byteLength(t);
     if (k.list.length >= L.eventsCount || k.bytes + size + 1 > L.eventsBytes) { k.truncated = true; return; }
     k.bytes += size + 1;
@@ -248,7 +248,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
         onEvent: (e, { stage }) => {
           r.events++;
           if (r.kept) keep(r.kept, e);
-          r.stage = stage || (typeof e.type === 'string' ? e.type.slice(0, 40) : '');
+          r.stage = stage || (typeof e.type === 'string' ? clip(e.type, 40) : '');
           if (Date.now() - last >= 1000) { last = Date.now(); emit(r, 'progress'); }
         },
       });

@@ -43,3 +43,28 @@ test('adapters: webSearch lets only WebSearch through for Claude Code and turns 
   assert.deepEqual(x.args, CODEX_020.map((a) => (a === 'web_search=disabled' ? 'web_search=live' : a)), 'the value is replaced in place, nothing else changed');
   assert.ok(x.args.includes('sandbox_workspace_write.network_access=false'), 'the sandbox keeps its network off');
 });
+
+const acc = () => ({ text: '', usage: { input: 0, output: 0 }, reports: 0, error: '', stage: '' });
+test('adapters: an item type that is an Object.prototype key is a plain stage, and box text is cut on a code point boundary', async () => {
+  const { clip } = await import('../src/adapters.mjs');
+  for (const t of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) {
+    const a = acc();
+    codex.job.event({ type: 'item.started', item: { type: t } }, a);
+    assert.equal(a.stage, t, t);
+  }
+  const a = acc();
+  codex.job.event({ type: 'item.started', item: { type: 'command_execution' } }, a);
+  assert.equal(a.stage, 'command');
+  codex.job.event({ type: 'item.started', item: { type: `${'S'.repeat(39)}\u{1F600}` } }, a);
+  assert.equal(a.stage, 'S'.repeat(39));
+  codex.job.event({ type: 'error', message: `${'e'.repeat(199)}\u{1F600}` }, a);
+  assert.equal(a.error, 'e'.repeat(199));
+  const c = acc();
+  claudeCode.job.event({ type: 'result', is_error: true, result: `${'r'.repeat(199)}\u{1F600}`, usage: {} }, c);
+  assert.equal(c.error, 'r'.repeat(199));
+  const g = acc();
+  grok.job.event({ type: 'error', message: `${'g'.repeat(199)}\u{1F600}` }, g);
+  assert.equal(g.error, 'g'.repeat(199));
+  assert.deepEqual([clip('ab\u{1F600}', 3), clip('ab\u{1F600}', 4), clip('ab\u{1F600}c', 4), clip('abc', 2), clip('a\ud800', 5)], ['ab', 'ab\u{1F600}', 'ab\u{1F600}', 'ab', 'a\ud800'],
+    'only a pair the cut splits loses its half; text that already ends in a lone half is not the cut\'s');
+});
