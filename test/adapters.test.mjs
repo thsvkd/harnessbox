@@ -1,5 +1,6 @@
-// The adapters' job commands as data, without a box: the hardened arguments of a default run are exactly the 0.2.0 ones, and
-// webSearch changes only the search switch (Claude Code: WebSearch out of the deny list and into an allow rule; Codex: web_search=live).
+// The adapters' job commands as data, without a box: the hardened arguments of a default run are the 0.2.0 ones (Claude Code's in
+// another order, so that no option that takes many values comes right before the caller's), and webSearch changes only the search
+// switch (Claude Code: WebSearch out of the deny list and into an allow rule; Codex: web_search=live).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
@@ -8,6 +9,10 @@ import { claudeCode, codex, grok } from '../src/index.mjs';
 const P = 'Read /work/request.md.', DIR = '/work', EXTRA = ['--model', 'm', '--extra-flag'], HAS = new Set(['--ignore-rules']);
 const CLAUDE_020 = ['-p', P, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk', '--strict-mcp-config', '--restricted',
   '--no-session-persistence', '--disallowedTools', 'WebFetch', 'WebSearch', 'mcp__*', ...EXTRA];
+const CLAUDE = ['-p', P, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk', '--disallowedTools', 'WebFetch', 'WebSearch', 'mcp__*',
+  '--strict-mcp-config', '--restricted', '--no-session-persistence', ...EXTRA];
+const CLAUDE_SEARCH = ['-p', P, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk', '--allowedTools', 'WebSearch', '--disallowedTools', 'WebFetch', 'mcp__*',
+  '--strict-mcp-config', '--restricted', '--no-session-persistence', ...EXTRA];
 const CODEX_020 = ['exec', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules', '-C', DIR, '-s', 'workspace-write',
   '-c', 'approval_policy=never', '-c', 'sandbox_workspace_write.network_access=false',
   '-c', 'sandbox_workspace_write.exclude_slash_tmp=true', '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true', '-c', 'mcp_servers={}',
@@ -16,9 +21,10 @@ const CODEX_020 = ['exec', '--skip-git-repo-check', '--ignore-user-config', '--i
 const GROK_020 = ['-p', P, '--output-format', 'streaming-json', '--cwd', DIR, '--disable-web-search', ...EXTRA];
 const command = (a, more = {}) => a.job.command({ prompt: P, dir: DIR, has: HAS, extra: EXTRA, ...more });
 
-test('adapters: a run without webSearch has exactly the 0.2.0 arguments', () => {
+test('adapters: a run without webSearch has the 0.2.0 arguments (Claude Code\'s reordered)', () => {
   for (const more of [{}, { webSearch: false }]) {
-    assert.deepEqual(command(claudeCode, more), { args: CLAUDE_020 });
+    assert.deepEqual(command(claudeCode, more), { args: CLAUDE });
+    assert.deepEqual([...CLAUDE].sort(), [...CLAUDE_020].sort(), 'the same elements as 0.2.0');
     assert.deepEqual(command(codex, more), { args: CODEX_020, stdin: P });
     assert.deepEqual(command(grok, more), { args: GROK_020 });
   }
@@ -30,18 +36,38 @@ test('adapters: webSearch lets only WebSearch through for Claude Code and turns 
   assert.equal(grok.webSearch, undefined, 'the runner refuses webSearch for it');
 
   const c = command(claudeCode, { webSearch: true }).args;
-  const denied = c.slice(c.indexOf('--disallowedTools') + 1, c.indexOf('--allowedTools'));
+  assert.deepEqual(c, CLAUDE_SEARCH);
+  const denied = c.slice(c.indexOf('--disallowedTools') + 1, c.indexOf('--strict-mcp-config'));
   assert.deepEqual(denied, ['WebFetch', 'mcp__*'], 'WebFetch and every MCP tool stay denied');
-  assert.deepEqual(c.slice(c.indexOf('--allowedTools'), c.indexOf('--allowedTools') + 2), ['--allowedTools', 'WebSearch']);
+  assert.deepEqual(c.slice(c.indexOf('--allowedTools'), c.indexOf('--allowedTools') + 3), ['--allowedTools', 'WebSearch', '--disallowedTools']);
   assert.equal(c.filter((x) => x === 'WebSearch').length, 1, 'WebSearch is not denied anywhere');
   for (const f of ['--permission-mode', 'dontAsk', '--restricted', '--strict-mcp-config', '--no-session-persistence']) assert.ok(c.includes(f), f);
   assert.deepEqual(c.slice(-EXTRA.length), EXTRA, 'the caller\'s options still come last');
-  assert.deepEqual(c.filter((x) => !['WebSearch', '--allowedTools'].includes(x)), CLAUDE_020.filter((x) => x !== 'WebSearch'), 'nothing else changed');
+  assert.deepEqual(c.filter((x) => !['WebSearch', '--allowedTools'].includes(x)), CLAUDE.filter((x) => x !== 'WebSearch'), 'nothing else changed');
 
   const x = command(codex, { webSearch: true });
   assert.ok(x.args.includes('web_search=live') && !x.args.includes('web_search=disabled'));
   assert.deepEqual(x.args, CODEX_020.map((a) => (a === 'web_search=disabled' ? 'web_search=live' : a)), 'the value is replaced in place, nothing else changed');
   assert.ok(x.args.includes('sandbox_workspace_write.network_access=false'), 'the sandbox keeps its network off');
+});
+
+// --allowedTools and --disallowedTools take every value up to the next option (Claude Code 2.1.300 checked against a mock API: with the
+// caller's args right after them, a leading Read was a deny rule without webSearch and an allow rule with it)
+test('adapters: Claude Code\'s caller args never follow an option that takes many values, with webSearch or without', () => {
+  const MANY = ['--allowedTools', '--disallowedTools', '--tools', '--add-dir', '--betas', '--mcp-config', '--plugin-dir'];
+  for (const extra of [['Read', 'Bash', '--allowedTools', 'Read(//work/**)'], ['Read'], []]) {
+    const argv = {};
+    for (const webSearch of [false, true]) {
+      const a = claudeCode.job.command({ prompt: P, dir: DIR, has: HAS, extra, webSearch }).args, own = a.slice(0, a.length - extra.length);
+      assert.deepEqual(a.slice(own.length), extra);
+      assert.deepEqual(own.slice(-3), ['--strict-mcp-config', '--restricted', '--no-session-persistence'], 'three flags without a value end the adapter\'s part');
+      assert.ok(own.findLastIndex((x) => MANY.includes(x)) < own.length - 3, `${webSearch}: no many-valued option runs into the caller's args`);
+      argv[webSearch] = a;
+    }
+    // the same caller args land after the same element either way: only the search switch differs
+    assert.equal(argv.false.length + 1, argv.true.length);
+    assert.deepEqual(argv.false.slice(-extra.length - 3), argv.true.slice(-extra.length - 3));
+  }
 });
 
 const acc = () => ({ text: '', usage: { input: 0, output: 0 }, reports: 0, error: '', stage: '' });

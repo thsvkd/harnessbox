@@ -5,8 +5,12 @@
 - Runner: `run({ webSearch: true })` turns on the CLI's own server-side web search for adapters that declare `webSearch`
   (Claude Code: `WebSearch` out of `--disallowedTools` and into `--allowedTools`, WebFetch and MCP tools still denied; Codex:
   `-c web_search=live` in place of `web_search=disabled`, its sandbox's network still off). Grok has none and refuses it. The box's
-  host lists are unchanged. Without it the CLI arguments are the 0.2.0 ones. `detect()` rows carry `webSearch`; `job.command` gets
-  `webSearch`.
+  host lists are unchanged. Without it the CLI arguments are the 0.2.0 ones (Claude Code's in another order, below). `detect()`
+  rows carry `webSearch`; `job.command` gets `webSearch`.
+- Adapters: Claude Code's `--disallowedTools` (and with webSearch `--allowedTools`) come before `--strict-mcp-config --restricted
+  --no-session-persistence` instead of last. Both take every value up to the next option, so a leading element of the caller's
+  args that is no option (`Read`, say) became a deny rule, in 0.2.0 too, and with webSearch's `--allowedTools` last it would have
+  become an allow rule. Now it is neither, with webSearch or without (checked with Claude Code 2.1.300 against a mock API).
 - Service: a client entry may set `"webSearch": true` and `"events": true` (default false; another value stops the service at
   start). `POST /v1/runs` takes `webSearch` and `events`; asking for one the client is not allowed is a 400
   (`web_search_not_allowed`, `events_not_allowed`; `web_search_unsupported` for Grok). `events: true` puts the CLI's JSON events

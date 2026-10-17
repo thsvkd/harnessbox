@@ -52,7 +52,8 @@ const CLAUDE_ACCOUNT = ['oauthAccount', 'userID', 'hasCompletedOnboarding', 'las
  * --no-session-persistence keeps the session out of ~/.claude/projects; dontAsk refuses every tool use no allow rule covers (the
  * caller adds --tools/--allowedTools rules in args, as absolute `//path` rules: a `./` rule moves with a Bash `cd`). WebFetch, WebSearch
  * and every MCP tool are denied; with webSearch, WebSearch (Anthropic's server-side search: titles and URLs, no page fetch) leaves the
- * deny list and gets an allow rule, since dontAsk refuses a tool no rule allows.
+ * deny list and gets an allow rule, since dontAsk refuses a tool no rule allows. Both lists come before the three flags, so the
+ * caller's args never start inside one.
  * @type {Adapter}
  */
 export const claudeCode = {
@@ -75,8 +76,11 @@ export const claudeCode = {
   expired: EXPIRED,
   webSearch: true,
   job: {
-    command: ({ prompt, extra, webSearch }) => ({ args: ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk', '--strict-mcp-config', '--restricted',
-      '--no-session-persistence', ...(webSearch ? ['--disallowedTools', 'WebFetch', 'mcp__*', '--allowedTools', 'WebSearch'] : ['--disallowedTools', 'WebFetch', 'WebSearch', 'mcp__*']), ...extra] }),
+    // --disallowedTools and --allowedTools take every value up to the next option: the caller's options never follow them directly
+    // (a leading Read would join the deny list, or with webSearch the allow list), the three flags without a value come between
+    command: ({ prompt, extra, webSearch }) => ({ args: ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk',
+      ...(webSearch ? ['--allowedTools', 'WebSearch', '--disallowedTools', 'WebFetch', 'mcp__*'] : ['--disallowedTools', 'WebFetch', 'WebSearch', 'mcp__*']),
+      '--strict-mcp-config', '--restricted', '--no-session-persistence', ...extra] }),
     // every result event counts (with a background Agent a run ends a turn and the Agent's notice opens another, each with a result of
     // its own usage); input counts the cache too; the last result is the model's last message; one marked as an error says why
     event: (e, acc) => {

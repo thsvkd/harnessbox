@@ -81,7 +81,9 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
 - `validate`: a command in a second box, no network, cwd `/work`, the same read-only folders and an empty home of its own (not the
   user's: it never sees their credential), after the CLI exited 0 or ran out of time (not after a failure or a cancel).
 - `model`: passed as `--model` (all three CLIs). `args`: extra CLI options after the adapter's hardened ones. They cannot widen the
-  box, but they can widen what the CLI lets the model do inside it (see the threat model). `timeoutMs` stops the CLI.
+  box, but they can widen what the CLI lets the model do inside it (see the threat model). Claude Code's adapter ends with flags
+  that take no value, so `args` never continue its `--disallowedTools` or `--allowedTools` list: give tool rules with your own
+  `--allowedTools`/`--disallowedTools`. `timeoutMs` stops the CLI.
 - `webSearch: true` (only for a client whose entry has `"webSearch": true`, else 400 `web_search_not_allowed`): the CLI's own
   server-side web search. Claude Code: `WebSearch` leaves `--disallowedTools` (WebFetch and MCP tools stay denied) and gets
   `--allowedTools WebSearch`; a `--tools` list in `args` must name `WebSearch` too. Codex: `-c web_search=live` instead of

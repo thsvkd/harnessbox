@@ -417,7 +417,7 @@ test('run: webSearch reaches each adapter\'s command in the box (Claude Code: We
       assert.ok(x.includes('web_search=disabled') && !x.includes('web_search=live'));
     }
     const c = await argsOf('claude-code', { webSearch: true, args: ['--allowedTools', 'Read(//work/**)'] });
-    assert.deepEqual(c.slice(c.indexOf('--disallowedTools'), c.indexOf('--disallowedTools') + 5), ['--disallowedTools', 'WebFetch', 'mcp__*', '--allowedTools', 'WebSearch']);
+    assert.deepEqual(c.slice(c.indexOf('--allowedTools'), c.indexOf('--allowedTools') + 6), ['--allowedTools', 'WebSearch', '--disallowedTools', 'WebFetch', 'mcp__*', '--strict-mcp-config']);
     assert.deepEqual(c.slice(-2), ['--allowedTools', 'Read(//work/**)'], 'the caller\'s own rules follow');
     const x = await argsOf('codex', { webSearch: true });
     assert.ok(x.includes('web_search=live') && !x.includes('web_search=disabled') && x.includes('sandbox_workspace_write.network_access=false'));
