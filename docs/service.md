@@ -128,7 +128,9 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
 - `error`: the service could not run it at all.
 
 `GET /v1/runs/:id/events` → Server-Sent Events: `state` (on each state change), `progress` (at most once a second while events
-arrive: `stage`, `events`), and `end` (the full run, outputs included), then the stream closes. Each `data:` is the run as JSON.
+arrive: `stage`, `events`), and `end` (the full run, outputs included), then the stream closes. Each `data:` is the run as JSON
+on one line; U+2028 and U+2029 inside its strings are written as `\u2028` and `\u2029` (here and in `GET /v1/runs/:id`), so a
+parser that ends lines at them still reads the whole line. Split lines at `\n` only.
 `DELETE /v1/runs/:id` cancels (204): a running CLI is killed; a queued run leaves the user's lock and the slot queue at once and
 ends without a box. Runs are kept 30 minutes after they end. **A restart forgets every run**: an unknown id is 404,
 and the client starts the run again.

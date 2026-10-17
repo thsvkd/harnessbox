@@ -55,7 +55,12 @@ export function harnessbox({ socketPath, url, token }) {
           for (let i; (i = buf.indexOf('\n\n')) >= 0;) {
             const block = buf.slice(0, i);
             buf = buf.slice(i + 2);
-            const event = /^event: (.+)$/m.exec(block)?.[1], data = /^data: (.+)$/m.exec(block)?.[1];
+            // lines end at \n only: a regex's . and $ would also end one at U+2028 or U+2029, which JSON strings may hold raw
+            let event = '', data = '';
+            for (const l of block.split('\n')) {
+              if (l.startsWith('event: ')) event = l.slice(7);
+              else if (l.startsWith('data: ')) data = l.slice(6);
+            }
             if (!event || !data) continue;
             let run;
             try { run = JSON.parse(data); } catch {

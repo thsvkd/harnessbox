@@ -354,7 +354,7 @@ test('service: file copies count against the file-count limit', BOX, async () =>
 const ROWS = [{ id: 'claude-code', name: 'Claude Code', version: '2.1.300', usable: true, why: null, webSearch: true },
   { id: 'codex', name: 'Codex', version: '0.162.1', usable: true, why: null, webSearch: true }, { id: 'grok', name: 'Grok', version: '1.0.52', usable: true, why: null, webSearch: false }];
 const FAKE_RESULT = { code: 0, text: 'done', usage: { input: 1, output: 2 }, error: '', stderr: '', why: null, timedOut: false, canceled: false };
-async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = '' } = {}) {
+async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = '', result = {} } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hb-fake-svc-')), runs = join(root, 'runs'), sock = join(root, 'hb.sock'), calls = [];
   mkdirSync(runs);
   const hb = {
@@ -363,14 +363,14 @@ async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = 
       o.onStart();
       for (const e of typeof events === 'function' ? events() : events) o.onEvent(e, { stage: '' });
       if (output) writeFileSync(join(o.dir, 'out.txt'), output);
-      return { ...FAKE_RESULT };
+      return { ...FAKE_RESULT, ...result };
     },
     exec: async () => ({ code: 0, out: '{}', why: null }),
   };
   const svc = createService({ hb, harnesses, runs, limits,
     clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appc', tokenSha256: hex(TOKEN.c), webSearch: true, events: true }] });
   await new Promise((r) => svc.server.listen(sock, r));
-  return { runs, map: svc.runs, calls, a: harnessbox({ socketPath: sock, token: TOKEN.a }), c: harnessbox({ socketPath: sock, token: TOKEN.c }),
+  return { runs, sock, map: svc.runs, calls, a: harnessbox({ socketPath: sock, token: TOKEN.a }), c: harnessbox({ socketPath: sock, token: TOKEN.c }),
     close: () => { svc.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
@@ -621,6 +621,50 @@ test('service: after the memory cap forgets runs, the heap holds about what is a
   const m = JSON.parse(r.stdout.trim().split('\n').at(-1));
   assert.ok(m.kept < 40 && m.accounted <= 20 * 2 ** 20, JSON.stringify(m));
   assert.ok(m.heap < m.accounted * 1.5, `heap grew ${(m.heap / 2 ** 20).toFixed(1)} MiB for ${(m.accounted / 2 ** 20).toFixed(1)} MiB accounted`);
+});
+
+test('service: U+2028 and U+2029 in an event and in result.text come back unchanged through events() and getRun, never raw on the wire', async () => {
+  const title = 'line\u2028separator and paragraph\u2029separator', text = 'last\u2028message\u2029';
+  const event = { type: 'item.completed', item: { type: 'web_search', title } };
+  for (const events of [[event], []]) {
+    const w = await fakeWorld({ events, result: { text } });
+    try {
+      const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: events.length > 0 })).id;
+      const seen = [];
+      const ended = await w.c.events(id, (e, run) => seen.push(`${e}:${run.state}`)), got = await w.c.getRun(id);
+      assert.deepEqual(ended, got);
+      assert.equal(seen.at(-1), 'end:done');
+      assert.equal(got.result.text, text);
+      if (events.length) assert.deepEqual(got.result.events, [event]);
+      // what a client copied from 0.3.0 reads (a regex whose $ also ends a line at U+2028): the server writes them escaped
+      const wire = await new Promise((done) => {
+        http.get({ socketPath: w.sock, path: `/v1/runs/${id}/events`, headers: { authorization: `Bearer ${TOKEN.c}` } }, (res) => {
+          let t = ''; res.setEncoding('utf8'); res.on('data', (d) => { t += d; }); res.on('end', () => done(t));
+        });
+      });
+      assert.doesNotMatch(wire, /[\u2028\u2029]/);
+      assert.match(wire, /\\u2028/);
+      assert.deepEqual(JSON.parse(/^data: (.+)$/m.exec(wire)[1]), got, 'the old client\'s parse gives the same run');
+    } finally { w.close(); }
+  }
+});
+
+test('client: a data line holding raw U+2028 and U+2029 (as a 0.3.0 server sent them) is one line', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-client-sse-')), sock = join(root, 'fake.sock');
+  const run = { id: 'run_x', state: 'done', result: { text: 'a\u2028b\u2029c' } };
+  const fake = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`event: end\ndata: ${JSON.stringify(run)}\n\n`);
+  });
+  await new Promise((r) => fake.listen(sock, r));
+  try {
+    assert.match(JSON.stringify(run), /\u2028/, 'JSON.stringify leaves it raw');
+    assert.deepEqual(await harnessbox({ socketPath: sock, token: TOKEN.a }).events('run_x'), run);
+  } finally {
+    fake.closeAllConnections();
+    fake.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('service: event and item types that are Object.prototype keys or end in half a surrogate pair stay plain strings', async () => {

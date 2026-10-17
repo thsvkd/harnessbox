@@ -115,15 +115,18 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   });
   // a run as JSON. Kept events are JSON text already (keep()), spliced in where result.events holds MARK: never parsed or serialized
   // again. Never throws (this runs in execute()'s finally, through emit): past a failure, the run without its events
-  // (eventsTruncated) or, last, its id and state.
+  // (eventsTruncated) or, last, its id and state. U+2028 and U+2029, which JSON.stringify leaves raw and which only occur inside JSON
+  // strings, are written as \u2028 and \u2029: the same JSON, and an SSE client that splits lines on them (as 0.3.0's client did) still
+  // reads one data line.
   const MARK = `hb-events-${randomBytes(12).toString('hex')}`;
+  const seps = (t) => t.replace(/[\u2028\u2029]/g, (ch) => (ch === '\u2028' ? '\\u2028' : '\\u2029'));
   const runJson = (r, full = true) => {
     const s = snapshot(r, full);
     try {
       const t = JSON.stringify(s), i = r.kept && s.result ? t.indexOf(`"${MARK}"`) : -1;
-      return i < 0 ? t : `${t.slice(0, i)}[${r.kept.list.join(',')}]${t.slice(i + MARK.length + 2)}`;
+      return seps(i < 0 ? t : `${t.slice(0, i)}[${r.kept.list.join(',')}]${t.slice(i + MARK.length + 2)}`);
     } catch {
-      try { return JSON.stringify({ ...s, ...(s.result ? { result: { ...s.result, events: [], eventsTruncated: true } } : {}) }); } catch { return JSON.stringify({ id: r.id, state: r.state, error: 'the run could not be serialized' }); }
+      try { return seps(JSON.stringify({ ...s, ...(s.result ? { result: { ...s.result, events: [], eventsTruncated: true } } : {}) })); } catch { return JSON.stringify({ id: r.id, state: r.state, error: 'the run could not be serialized' }); }
     }
   };
   // an ended run leaves the map and lets go of what it holds: its expiry timer is cleared (it would keep the run for keepMs) and the

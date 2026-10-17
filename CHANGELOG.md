@@ -26,6 +26,10 @@
   `bins` and `pins` are read by own keys.
 - Service: `GET /v1/harnesses` rows carry `webSearch` (the adapter supports it).
 - `harnessbox/client`: types for `webSearch`, `events`, `result.events`, `result.eventsTruncated` and the harness list's `webSearch`.
+- `harnessbox/client`: `events()` splits the stream's lines at `\n` only. Its regex also ended a line at U+2028 or U+2029, which
+  `JSON.stringify` leaves raw in strings (a search result's title, the last message), and the run then failed with `bad_event`, in
+  0.2.0 too. The service now writes those two as `\u2028` and `\u2029` in every run it sends (the same JSON), so a client copied
+  from an earlier release reads them too.
 
 ## 0.2.0
 
