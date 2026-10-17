@@ -503,6 +503,37 @@ test('service: args that name web search are refused for a client without webSea
   } finally { w.close(); }
 });
 
+test('service: the args check still refuses every spelling it refused, lets a backslash path through, and Codex gets web_search=disabled last', async () => {
+  const w = await fakeWorld();
+  try {
+    const refused = [
+      ['codex', ['-c', 'web_search=live'], 'web_search_not_allowed'], ['codex', ['--config=web_search=live'], 'web_search_not_allowed'],
+      ['codex', ['-cweb_search=live'], 'web_search_not_allowed'], ['codex', ['-c', ' WEB_SEARCH = "live" '], 'web_search_not_allowed'],
+      ['codex', ['-c', 'Web Search=live'], 'web_search_not_allowed'], ['codex', ['-c', '"web_\\u0073earch"="live"'], 'bad_args'],
+      ['codex', ['-c', 'tools.web_\\U00000073earch={}'], 'bad_args'], ['codex', ['-c', 'web_\\u0053EARCH=1'], 'bad_args'],
+      ['codex', ['-c', 'features={"web\\u005fsearch_request"=true}'], 'bad_args'], ['claude-code', ['--allowedTools', 'Web\\u0053earch'], 'bad_args'],
+      ['claude-code', ['--settings', '/work/s.json'], 'bad_args'], ['claude-code', ['--settings={s.json'], 'bad_args'],
+      // still refused, though they could not turn search on: the check reads no option's meaning (docs/service.md)
+      ['claude-code', ['--append-system-prompt', 'Never use web search.'], 'web_search_not_allowed'], ['claude-code', ['--disallowedTools', 'WebSearch'], 'web_search_not_allowed'],
+      ['claude-code', ['--append-system-prompt', 'See C:\\work\\u00e9t\\u00e9'], 'bad_args'],
+    ];
+    for (const [harness, args, code] of refused) await assert.rejects(w.a.run({ user: 'u1', harness, prompt: 'x', args }), { status: 400, code }, JSON.stringify(args));
+    assert.equal(w.calls.length, 0);
+    // a backslash that starts no \uXXXX escape (a Windows path) is no escape: 0.3.0 before this refused it
+    for (const args of [['--append-system-prompt', 'Paths look like C:\\Users\\me'], ['--append-system-prompt', 'C:\\Users\\u'], ['--add-dir', 'C:\\u12']]) {
+      assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', args })).id)).state, 'done', JSON.stringify(args));
+      assert.deepEqual(w.calls.at(-1).args, args);
+    }
+    // whatever the args, a Codex run without webSearch ends -c web_search=disabled -: also for a client allowed webSearch, whose args are not checked
+    for (const [hb, args] of [[w.a, ['-c', 'model_reasoning_effort="low"']], [w.c, ['-c', 'web_search=live']], [w.c, ['--config=web_search=live', '-c', '"web_\\u0073earch"="live"']]]) {
+      assert.equal((await hb.events((await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', args })).id)).state, 'done');
+      const { args: extra, webSearch } = w.calls.at(-1);
+      assert.deepEqual([extra, webSearch], [args, false]);
+      assert.deepEqual(codex.job.command({ prompt: 'x', dir: BOX_DIR, has: new Set(), extra, webSearch }).args.slice(-3), ['-c', 'web_search=disabled', '-'], JSON.stringify(args));
+    }
+  } finally { w.close(); }
+});
+
 test('service: a --settings value is inline only when, trimmed, it parses as a JSON object; anything Claude Code would open as a file is refused', async () => {
   const w = await fakeWorld();
   try {

@@ -1,6 +1,7 @@
 // The adapters' job commands as data, without a box: the hardened arguments of a default run are the 0.2.0 ones (Claude Code's in
-// another order, so that no option that takes many values comes right before the caller's), and webSearch changes only the search
-// switch (Claude Code: WebSearch out of the deny list and into an allow rule; Codex: web_search=live).
+// another order, so that no option that takes many values comes right before the caller's; Codex's with web_search=disabled once more
+// after the caller's), and webSearch changes only the search switch (Claude Code: WebSearch out of the deny list and into an allow
+// rule; Codex: web_search=live, and no second one).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
@@ -18,14 +19,15 @@ const CODEX_020 = ['exec', '--skip-git-repo-check', '--ignore-user-config', '--i
   '-c', 'sandbox_workspace_write.exclude_slash_tmp=true', '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true', '-c', 'mcp_servers={}',
   '-c', 'features.apps=false', '-c', 'features.plugins=false', '-c', 'features.remote_plugin=false', '-c', 'web_search=disabled', '-c', 'skills.include_instructions=false',
   '--disable', 'plugins', '--disable', 'apps', '--ephemeral', '--json', '-o', join(DIR, '.codex-last-message.txt'), ...EXTRA, '-'];
+const CODEX = [...CODEX_020.slice(0, -1), '-c', 'web_search=disabled', '-'];
 const GROK_020 = ['-p', P, '--output-format', 'streaming-json', '--cwd', DIR, '--disable-web-search', ...EXTRA];
 const command = (a, more = {}) => a.job.command({ prompt: P, dir: DIR, has: HAS, extra: EXTRA, ...more });
 
-test('adapters: a run without webSearch has the 0.2.0 arguments (Claude Code\'s reordered)', () => {
+test('adapters: a run without webSearch has the 0.2.0 arguments (Claude Code\'s reordered; Codex\'s web_search=disabled again last)', () => {
   for (const more of [{}, { webSearch: false }]) {
     assert.deepEqual(command(claudeCode, more), { args: CLAUDE });
     assert.deepEqual([...CLAUDE].sort(), [...CLAUDE_020].sort(), 'the same elements as 0.2.0');
-    assert.deepEqual(command(codex, more), { args: CODEX_020, stdin: P });
+    assert.deepEqual(command(codex, more), { args: CODEX, stdin: P });
     assert.deepEqual(command(grok, more), { args: GROK_020 });
   }
 });
@@ -67,6 +69,19 @@ test('adapters: Claude Code\'s caller args never follow an option that takes man
     // the same caller args land after the same element either way: only the search switch differs
     assert.equal(argv.false.length + 1, argv.true.length);
     assert.deepEqual(argv.false.slice(-extra.length - 3), argv.true.slice(-extra.length - 3));
+  }
+});
+
+// Codex takes the last -c for a key (0.162.1 checked against a mock API: a caller's -c web_search=live, --config=web_search=live,
+// -cweb_search=live or ' web_search = "live" ' put the web_search tool in the request before, and none does with this argv)
+test('adapters: without webSearch, Codex\'s web_search=disabled comes after every caller arg, right before the prompt marker', () => {
+  for (const extra of [['-c', 'web_search=live'], ['--config=web_search=live'], ['-cweb_search=live'], ['-c', ' web_search = "live" '], []]) {
+    const a = codex.job.command({ prompt: P, dir: DIR, has: HAS, extra, webSearch: false }).args;
+    assert.deepEqual(a.slice(-3), ['-c', 'web_search=disabled', '-'], JSON.stringify(extra));
+    assert.deepEqual(a.slice(-3 - extra.length, -3), extra);
+    const w = codex.job.command({ prompt: P, dir: DIR, has: HAS, extra, webSearch: true }).args;
+    assert.deepEqual(w.slice(-1 - extra.length), [...extra, '-'], 'with webSearch the caller\'s args are last, as before');
+    assert.ok(!w.includes('web_search=disabled'));
   }
 });
 

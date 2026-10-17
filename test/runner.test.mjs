@@ -415,7 +415,11 @@ test('run: webSearch reaches each adapter\'s command in the box (Claude Code: We
       assert.deepEqual(c.slice(c.indexOf('--disallowedTools'), c.indexOf('--disallowedTools') + 4), ['--disallowedTools', 'WebFetch', 'WebSearch', 'mcp__*']);
       assert.ok(!c.includes('--allowedTools'));
       assert.ok(x.includes('web_search=disabled') && !x.includes('web_search=live'));
+      assert.deepEqual(x.slice(-3), ['-c', 'web_search=disabled', '-']);
     }
+    // the caller's -c web_search=live comes before the adapter's last web_search=disabled (Codex takes the last -c for a key)
+    const late = await argsOf('codex', { args: ['-c', 'web_search=live'] });
+    assert.deepEqual(late.slice(-5), ['-c', 'web_search=live', '-c', 'web_search=disabled', '-']);
     const c = await argsOf('claude-code', { webSearch: true, args: ['--allowedTools', 'Read(//work/**)'] });
     assert.deepEqual(c.slice(c.indexOf('--allowedTools'), c.indexOf('--allowedTools') + 6), ['--allowedTools', 'WebSearch', '--disallowedTools', 'WebFetch', 'mcp__*', '--strict-mcp-config']);
     assert.deepEqual(c.slice(-2), ['--allowedTools', 'Read(//work/**)'], 'the caller\'s own rules follow');

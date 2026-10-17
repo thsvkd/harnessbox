@@ -103,7 +103,7 @@ const CODEX_STAGE = { command_execution: 'command', file_change: 'file change', 
  * the user's config.toml and execpolicy rules are not read; the sandbox's network, MCP servers, apps, remote plugins, web search and
  * the user's skills list are off; workspace-write may not write /tmp or $TMPDIR. Its own sandbox needs user namespaces: nested. With
  * webSearch, web_search=live instead of disabled: the Responses API's hosted web_search tool, run by OpenAI (the sandbox's network
- * stays off).
+ * stays off). Without it, web_search=disabled once more after the caller's args.
  * @type {Adapter}
  */
 export const codex = {
@@ -124,7 +124,9 @@ export const codex = {
         '-c', 'approval_policy=never', '-c', 'sandbox_workspace_write.network_access=false',
         '-c', 'sandbox_workspace_write.exclude_slash_tmp=true', '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true', '-c', 'mcp_servers={}',
         '-c', 'features.apps=false', '-c', 'features.plugins=false', '-c', 'features.remote_plugin=false', '-c', webSearch ? 'web_search=live' : 'web_search=disabled', '-c', 'skills.include_instructions=false',
-        '--disable', 'plugins', '--disable', 'apps', '--ephemeral', '--json', '-o', join(dir, CODEX_LAST), ...extra, '-'],
+        '--disable', 'plugins', '--disable', 'apps', '--ephemeral', '--json', '-o', join(dir, CODEX_LAST), ...extra,
+        // the last -c for a key wins: without webSearch, the caller's args cannot set web_search again
+        ...(webSearch ? [] : ['-c', 'web_search=disabled']), '-'],
       stdin: prompt,
     }),
     event: (e, acc) => {

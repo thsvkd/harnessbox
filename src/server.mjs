@@ -160,11 +160,13 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     if (b.webSearch && !known.get(h).webSearch) no(400, 'web_search_unsupported', `${known.get(h).name} does not support webSearch on this service`);
     if (b.events && !c.events) no(400, 'events_not_allowed', 'events is not allowed for this client');
     const args = strings(b.args, 64, 'args'), outputs = strings(b.outputs, L.outputs, 'outputs'), readonly = strings(b.readonly, 16, 'readonly');
-    // nor through its CLI options (the caller's come after the adapter's: Codex's last -c web_search wins; Claude Code's --allowedTools,
-    // --tools): an option that names web search is refused. Other options that widen the CLI are not checked (docs/service.md).
+    // nor through its CLI options. The adapters hold the line (Codex: web_search=disabled again after the caller's args, and the last -c
+    // wins; Claude Code: --disallowedTools WebSearch, and a deny beats any allow); on top, an element that names web search is refused,
+    // even in a prompt-like value or a deny rule. Other options that widen the CLI are not checked (docs/service.md).
     if (!c.webSearch && args.some((a) => /web[\s_-]?search/i.test(a))) no(400, 'web_search_not_allowed', 'args may not name web search for this client');
-    // a check by spelling only: \u escapes (TOML, JSON) and a --settings file could spell it otherwise, so those are refused too
-    if (!c.webSearch && args.some((a, i) => /\\u/i.test(a) || (a === '--settings' && !jsonObject(args[i + 1])) || (a.startsWith('--settings=') && !jsonObject(a.slice(11))))) {
+    // a check by spelling only: TOML and JSON \u and \U escapes (always hex digits: a Windows path's \Users is none) and a --settings
+    // file could spell it otherwise, so those are refused too
+    if (!c.webSearch && args.some((a, i) => /\\u[0-9a-f]{4}/i.test(a) || (a === '--settings' && !jsonObject(args[i + 1])) || (a.startsWith('--settings=') && !jsonObject(a.slice(11))))) {
       no(400, 'bad_args', 'args may not carry \\u escapes or a --settings file for this client');
     }
     if (![...outputs, ...readonly].every(safePath) || new Set(outputs).size !== outputs.length) no(400, 'bad_path', 'outputs and readonly are distinct relative paths');

@@ -5,8 +5,8 @@
 - Runner: `run({ webSearch: true })` turns on the CLI's own server-side web search for adapters that declare `webSearch`
   (Claude Code: `WebSearch` out of `--disallowedTools` and into `--allowedTools`, WebFetch and MCP tools still denied; Codex:
   `-c web_search=live` in place of `web_search=disabled`, its sandbox's network still off). Grok has none and refuses it. The box's
-  host lists are unchanged. Without it the CLI arguments are the 0.2.0 ones (Claude Code's in another order, below). `detect()`
-  rows carry `webSearch`; `job.command` gets `webSearch`.
+  host lists are unchanged. Without it the CLI arguments are the 0.2.0 ones (Claude Code's in another order, Codex's with one more
+  `-c web_search=disabled`, below). `detect()` rows carry `webSearch`; `job.command` gets `webSearch`.
 - Adapters: Claude Code's `--disallowedTools` (and with webSearch `--allowedTools`) come before `--strict-mcp-config --restricted
   --no-session-persistence` instead of last. Both take every value up to the next option, so a leading element of the caller's
   args that is no option (`Read`, say) became a deny rule, in 0.2.0 too, and with webSearch's `--allowedTools` last it would have
@@ -20,10 +20,17 @@
   that does not serialize or is too deep becomes `{ type, truncated: true }`, and a run's answer, SSE events included, falls back
   to the run without its events rather than throwing. Ended runs' kept events count against the 256 MiB at their in-memory size
   (an active run's once it ends). Runs without the fields are unchanged.
-- Service: a client without `webSearch` may not spell web search in `args` (400 `web_search_not_allowed`): Codex's later
-  `-c web_search=live` overrode the adapter's `web_search=disabled`, in 0.2.0 too. For such a client an element with a `\u`
-  escape or a `--settings` value that is not inline JSON (trimmed, a JSON object; anything else Claude Code may open as a file) is
-  a 400 `bad_args`. A check by spelling, not a boundary; other options in `args` still widen the CLI.
+- Adapters: without webSearch, Codex gets `-c web_search=disabled` once more after the caller's args, right before `-`. Codex
+  takes the last `-c` for a key, so a caller's `-c web_search=live` (or `--config=web_search=live`, `-cweb_search=live`) overrode
+  the adapter's earlier one, in 0.2.0 too; now it does not, for any client (checked with Codex 0.162.1 against a mock API). With
+  webSearch the arguments are as before.
+- Service: a client without `webSearch` may not spell web search in `args` (400 `web_search_not_allowed`). For such a client an
+  element with a `\uXXXX` or `\UXXXXXXXX` escape (a backslash before anything else, such as a Windows path, is none) or a
+  `--settings` value that is not inline JSON (trimmed, a JSON object; anything else Claude Code may open as a file) is a 400
+  `bad_args`. A check by spelling, not a boundary; other options in `args` still widen the CLI. It reads no option's meaning, so
+  some `args` that 0.2.0 passed are now a 400 for such a client, also ones that could not turn search on: a deny rule naming
+  `WebSearch`, a prompt-like value that mentions web search (`--append-system-prompt "Never use web search."`), an escape such
+  as `\u00e9` in any element.
 - Runner: a stdout line that parses as a JSON array is no event, like a scalar or `null` before it: `onEvent` and the adapter's
   `event` no longer see it (it reached `result.events` as an array).
 - Service: a forgotten ended run (memory cap, run cap, keepMs) clears its expiry timer and drops its events, outputs and result,

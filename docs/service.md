@@ -89,18 +89,25 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
   `--allowedTools WebSearch`; a `--tools` list in `args` must name `WebSearch` too. Codex: `-c web_search=live` instead of
   `web_search=disabled`; its sandbox keeps no network. Grok: 400 `web_search_unsupported`. The search runs at Anthropic or OpenAI;
   the box's hosts are the same (see the threat model).
-- For a client without `"webSearch": true`, `args` are checked by spelling, which is all this is: an element that spells web search
-  literally (`web search`, `web_search`, `web-search` or `websearch`, any case; Codex's `-c web_search=live`, which would win over
-  the adapter's because the caller's options come last, `-c tools.web_search=…`, `--enable web_search_request`, Claude Code's
-  `--allowedTools WebSearch` or `--tools …,WebSearch`, a `--settings` JSON naming it) is a 400 `web_search_not_allowed`, even one
-  that would only deny it; an element with a `\u`/`\U` escape, and a `--settings` value (`--settings v` or `--settings=v`) that,
-  trimmed, does not parse as a JSON object (Claude Code opens it as a file unless it starts with `{` and ends with `}`), are a
-  400 `bad_args`. Past this check, Claude Code still has the adapter's `--disallowedTools WebSearch`, and a deny beats any
-  allow. Codex has only the adapter's explicit `web_search=disabled`, and a later `-c` for the same key wins over it: a spelling
-  this check misses (another escape or quoting of the TOML key, a config key or alias that sets search without spelling it, a
-  settings file reached another way) can turn search on. Nor are the other options that widen what the CLI lets the model do checked
-  (another `-c` key, `--settings` hooks or permissions, `--add-dir`, more tools), as before. Give such clients' args only from
-  your own code.
+- A run without `webSearch` keeps the CLI's search off whatever `args` say, for every client (one whose entry has
+  `"webSearch": true` too): Claude Code has the adapter's `--disallowedTools WebSearch`, and a deny beats any allow; Codex gets
+  `-c web_search=disabled` once more after `args`, right before the prompt marker `-`, and Codex takes the last `-c` for a key
+  (checked with Codex 0.162.1 against a mock API: a caller's `-c web_search=live`, `--config=web_search=live` or
+  `-cweb_search=live` no longer puts the search tool in the request; `args` ending in `--` or a lone `-c` make Codex exit with a
+  usage error).
+- For a client without `"webSearch": true`, `args` are also checked by spelling, which is all this is: an element that spells web
+  search literally (`web search`, `web_search`, `web-search` or `websearch`, any case: Codex's `-c web_search=live`,
+  `-c tools.web_search=…`, `--enable web_search_request`, Claude Code's `--allowedTools WebSearch` or `--tools …,WebSearch`, a
+  `--settings` JSON naming it) is a 400 `web_search_not_allowed`. The check reads no option's meaning, so it also refuses elements
+  that could not turn search on: a deny rule (`--disallowedTools WebSearch`) or a prompt-like value that mentions it
+  (`--append-system-prompt "Never use web search."`). An element with a TOML or JSON escape (`\u` and four hex digits, or `\U`
+  and eight; a backslash before anything else, such as a Windows path's `\Users`, is none), and a `--settings` value
+  (`--settings v` or `--settings=v`) that, trimmed, does not parse as a JSON object (Claude Code opens it as a file unless it
+  starts with `{` and ends with `}`), are a 400 `bad_args`. These 400s are new in 0.3.0: some `args` that 0.2.0 passed to the
+  CLI are refused now; reword them, or send them for a client whose entry has `"webSearch": true` (not checked). Neither the
+  adapters nor the check stop a config key or alias other than `web_search` that would turn search on without spelling it, nor
+  the other options that widen what the CLI lets the model do (another `-c` key, `--settings` hooks or permissions, `--add-dir`,
+  more tools), as before. Give such clients' args only from your own code.
 - `events: true` (only for a client whose entry has `"events": true`, else 400 `events_not_allowed`): the run's
   `result.events` holds the CLI's stdout events (Claude Code's stream-json, Codex's `--json`, Grok's streaming-json), in order:
   each line that parsed as a JSON object (a line that is an array, a string, a number or `null` is no event and is skipped), the
