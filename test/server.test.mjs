@@ -463,6 +463,29 @@ test('service: kept events count against the ended runs\' memory cap', async () 
   } finally { w.close(); }
 });
 
+const RVA_CLAUDE_ARGS = ['--tools', 'Read,Write,Edit,Agent,Bash', '--allowedTools', 'Read(//work/**)', 'Edit(//work/out/**)', 'Agent',
+  'Bash(python3 -I /work/skill/write-review/scripts/validate_draft.py *)', '--max-turns', '80'];
+test('service: args that name web search are refused for a client without webSearch; review-automation\'s args and a client allowed to search pass', async () => {
+  const w = await fakeWorld();
+  try {
+    for (const [harness, args] of [['codex', ['-c', 'web_search=live']], ['codex', ['-c', 'WEB_SEARCH="live"']], ['codex', ['-c', 'tools.web_search={}']],
+      ['codex', ['--enable', 'web_search_request']], ['claude-code', ['--allowedTools', 'WebSearch']], ['claude-code', ['--allowedTools', 'Read,WebSearch']],
+      ['claude-code', ['--tools', 'Read,websearch']], ['claude-code', ['--allowed-tools=WebSearch']], ['claude-code', ['--settings', '{"permissions":{"allow":["WebSearch"]}}']],
+      ['grok', ['--enable-web-search']], ['grok', ['--web search']]]) {
+      await assert.rejects(w.a.run({ user: 'u1', harness, prompt: 'x', args }), { status: 400, code: 'web_search_not_allowed' }, JSON.stringify(args));
+    }
+    assert.equal(w.calls.length, 0);
+    // review-automation's draft job (docs/service.md): its Claude Code options, none for Codex; a prompt is not checked
+    for (const [harness, args] of [['claude-code', RVA_CLAUDE_ARGS], ['codex', []], ['codex', undefined]]) {
+      const r = await w.a.events((await w.a.run({ user: 'u1', harness, prompt: 'Search the web for nothing; read /work/request.md.', ...(args ? { args } : {}) })).id);
+      assert.equal(r.state, 'done');
+      assert.deepEqual(w.calls.at(-1).args, args ?? []);
+    }
+    const r = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', args: ['-c', 'web_search=live'] })).id);
+    assert.equal(r.state, 'done', 'a client allowed webSearch keeps its options');
+  } finally { w.close(); }
+});
+
 // {"type":"deep","a":{"a":…1…}} nested n objects under the top one: n + 1 deep, parsed the way the runner parses a line
 const deepEvent = (n) => JSON.parse(`{"type":"deep","a":${'{"a":'.repeat(n)}1${'}'.repeat(n)}}`);
 test('service: an event nested past the stack or past eventDepth is kept as { type, truncated }, and the end, GET and the service go on', async () => {

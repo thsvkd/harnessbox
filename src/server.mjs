@@ -141,6 +141,9 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     if (b.webSearch && !known.get(h).webSearch) no(400, 'web_search_unsupported', `${known.get(h).name} does not support webSearch on this service`);
     if (b.events && !c.events) no(400, 'events_not_allowed', 'events is not allowed for this client');
     const args = strings(b.args, 64, 'args'), outputs = strings(b.outputs, L.outputs, 'outputs'), readonly = strings(b.readonly, 16, 'readonly');
+    // nor through its CLI options (the caller's come after the adapter's: Codex's last -c web_search wins; Claude Code's --allowedTools,
+    // --tools): an option that names web search is refused. Other options that widen the CLI are not checked (docs/service.md).
+    if (!c.webSearch && args.some((a) => /web[\s_-]?search/i.test(a))) no(400, 'web_search_not_allowed', 'args may not name web search for this client');
     if (![...outputs, ...readonly].every(safePath) || new Set(outputs).size !== outputs.length) no(400, 'bad_path', 'outputs and readonly are distinct relative paths');
     if (readonly.some((p) => readonly.some((q) => q !== p && (q.startsWith(`${p}/`) || q === p)))) no(400, 'bad_path', 'readonly folders may not overlap');
     let validate = null;
