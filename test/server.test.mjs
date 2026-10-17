@@ -493,6 +493,14 @@ test('service: args that name web search are refused for a client without webSea
     }
     const r = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', args: ['-c', 'web_search=live'] })).id);
     assert.equal(r.state, 'done', 'a client allowed webSearch keeps its options');
+    // spelled otherwise: \u escapes and a --settings file are refused to a client without webSearch, a --settings JSON is not
+    for (const [harness, args] of [['codex', ['-c', '"web_\\u0073earch"="live"']], ['codex', ['-c', 'tools.web_\\U00000073earch={}']],
+      ['claude-code', ['--allowedTools', 'Web\\u0053earch']], ['claude-code', ['--settings', '/work/settings.json']], ['claude-code', ['--settings=/work/settings.json']],
+      ['claude-code', ['--settings']]]) {
+      await assert.rejects(w.a.run({ user: 'u1', harness, prompt: 'x', args }), { status: 400, code: 'bad_args' }, JSON.stringify(args));
+    }
+    for (const args of [['--settings', '{"model":"sonnet"}'], ['--settings={"model":"sonnet"}']]) assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', args })).id)).state, 'done');
+    assert.equal((await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', args: ['-c', '"web_\\u0073earch"="live"'] })).id)).state, 'done', 'a client allowed webSearch is not checked');
   } finally { w.close(); }
 });
 
@@ -528,6 +536,24 @@ test('service: eventsCount keeps exactly that many events; one more marks events
       assert.deepEqual([r.result.events.length, r.result.eventsTruncated], [2000, truncated], `${n} small events: the default 2000`);
     } finally { w.close(); }
   }
+});
+
+// streamer-manager's options (its harnessbox runs): none names web search, carries a \u escape or a --settings file
+const SM_CODEX_ARGS = ['-c', 'features.shell_tool=false', '-c', 'features.unified_exec=false', '-c', 'features.apply_patch_freeform=false', '-c', 'forced_login_method="chatgpt"',
+  '--image=/work/image.jpg', '-c', 'model_reasoning_effort="medium"'];
+const SM_CLAUDE_ARGS = ['--tools', 'Read', '--allowedTools', 'Read(//work/**)', '--setting-sources', '', '--disable-slash-commands', '--no-chrome', '--prompt-suggestions', 'false',
+  '--permission-prompts', 'none', '--effort', 'low', '--max-turns', '8'];
+test('service: review-automation\'s and streamer-manager\'s options pass the args checks unchanged', async () => {
+  const w = await fakeWorld();
+  try {
+    for (const [harness, args] of [['claude-code', RVA_CLAUDE_ARGS], ['claude-code', SM_CLAUDE_ARGS], ['codex', SM_CODEX_ARGS]]) {
+      for (const hb of [w.a, w.c]) {
+        const r = await hb.events((await hb.run({ user: 'u1', harness, prompt: 'x', args })).id);
+        assert.equal(r.state, 'done', `${harness} ${JSON.stringify(args)}`);
+        assert.deepEqual(w.calls.at(-1).args, args);
+      }
+    }
+  } finally { w.close(); }
 });
 
 test('service: a forgotten run lets go of its events, outputs and result, whether the memory cap, the run cap or keepMs forgets it', async () => {

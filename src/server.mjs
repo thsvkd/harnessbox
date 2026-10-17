@@ -156,6 +156,10 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     // nor through its CLI options (the caller's come after the adapter's: Codex's last -c web_search wins; Claude Code's --allowedTools,
     // --tools): an option that names web search is refused. Other options that widen the CLI are not checked (docs/service.md).
     if (!c.webSearch && args.some((a) => /web[\s_-]?search/i.test(a))) no(400, 'web_search_not_allowed', 'args may not name web search for this client');
+    // a check by spelling only: \u escapes (TOML, JSON) and a --settings file could spell it otherwise, so those are refused too
+    if (!c.webSearch && args.some((a, i) => /\\u/i.test(a) || (a === '--settings' && !args[i + 1]?.startsWith('{')) || (a.startsWith('--settings=') && !a.slice(11).startsWith('{')))) {
+      no(400, 'bad_args', 'args may not carry \\u escapes or a --settings file for this client');
+    }
     if (![...outputs, ...readonly].every(safePath) || new Set(outputs).size !== outputs.length) no(400, 'bad_path', 'outputs and readonly are distinct relative paths');
     if (readonly.some((p) => readonly.some((q) => q !== p && (q.startsWith(`${p}/`) || q === p)))) no(400, 'bad_path', 'readonly folders may not overlap');
     let validate = null;

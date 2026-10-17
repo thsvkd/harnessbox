@@ -15,8 +15,10 @@
   `{ type, truncated: true }`, and a run's answer, SSE events included, falls back to the run without its events rather than
   throwing. Ended runs' kept events count against the 256 MiB at their in-memory size (an active run's once it ends). Runs
   without the fields are unchanged.
-- Service: a client without `webSearch` may not name web search in `args` (400 `web_search_not_allowed`): Codex's later
-  `-c web_search=live` overrode the adapter's `web_search=disabled`, in 0.2.0 too. Other options in `args` still widen the CLI.
+- Service: a client without `webSearch` may not spell web search in `args` (400 `web_search_not_allowed`): Codex's later
+  `-c web_search=live` overrode the adapter's `web_search=disabled`, in 0.2.0 too. For such a client an element with a `\u`
+  escape or a `--settings` file path is a 400 `bad_args`. A check by spelling, not a boundary; other options in `args` still widen
+  the CLI.
 - Service: a forgotten ended run (memory cap, run cap, keepMs) clears its expiry timer and drops its events, outputs and result,
   so the 30-minute timer no longer keeps every forgotten run in memory.
 - Service: `GET /v1/harnesses` rows carry `webSearch` (the adapter supports it).

@@ -87,12 +87,17 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
   `--allowedTools WebSearch`; a `--tools` list in `args` must name `WebSearch` too. Codex: `-c web_search=live` instead of
   `web_search=disabled`; its sandbox keeps no network. Grok: 400 `web_search_unsupported`. The search runs at Anthropic or OpenAI;
   the box's hosts are the same (see the threat model).
-- A client without `"webSearch": true` cannot turn search on through `args` either: an `args` element that names web search
-  (`web search`, `web_search`, `web-search`, `websearch`, any case: Codex's `-c web_search=live`, which would win over the adapter's
-  because the caller's options come last, `-c tools.web_search=…`, `--enable web_search_request`, Claude Code's `--allowedTools
-  WebSearch` or `--tools …,WebSearch`, a `--settings` JSON that allows it) is a 400 `web_search_not_allowed`, even one that would
-  only deny it. This is not a full check of what `args` can do: other options still widen what the CLI lets the model do (another
-  `-c` key, `--settings` hooks or permissions, `--add-dir`, more tools), as they did before.
+- For a client without `"webSearch": true`, `args` are checked by spelling, which is all this is: an element that spells web search
+  literally (`web search`, `web_search`, `web-search` or `websearch`, any case; Codex's `-c web_search=live`, which would win over
+  the adapter's because the caller's options come last, `-c tools.web_search=…`, `--enable web_search_request`, Claude Code's
+  `--allowedTools WebSearch` or `--tools …,WebSearch`, a `--settings` JSON naming it) is a 400 `web_search_not_allowed`, even one
+  that would only deny it; an element with a `\u`/`\U` escape, and `--settings` followed by anything but inline JSON (a file path),
+  are a 400 `bad_args`. Past this check, Claude Code still has the adapter's `--disallowedTools WebSearch`, and a deny beats any
+  allow. Codex has only the adapter's explicit `web_search=disabled`, and a later `-c` for the same key wins over it: a spelling
+  this check misses (another escape or quoting of the TOML key, a config key or alias that sets search without spelling it, a
+  settings file reached another way) can turn search on. Nor are the other options that widen what the CLI lets the model do checked
+  (another `-c` key, `--settings` hooks or permissions, `--add-dir`, more tools), as before. Give such clients' args only from
+  your own code.
 - `events: true` (only for a client whose entry has `"events": true`, else 400 `events_not_allowed`): the run's
   `result.events` holds the CLI's stdout events, each line that parsed as a JSON object, as printed (Claude Code's stream-json,
   Codex's `--json`, Grok's streaming-json), in order: the first 2000 and the first 1 MiB of them (as JSON, a comma each; past
