@@ -354,7 +354,7 @@ test('service: file copies count against the file-count limit', BOX, async () =>
 const ROWS = [{ id: 'claude-code', name: 'Claude Code', version: '2.1.300', usable: true, why: null, webSearch: true },
   { id: 'codex', name: 'Codex', version: '0.162.1', usable: true, why: null, webSearch: true }, { id: 'grok', name: 'Grok', version: '1.0.52', usable: true, why: null, webSearch: false }];
 const FAKE_RESULT = { code: 0, text: 'done', usage: { input: 1, output: 2 }, error: '', stderr: '', why: null, timedOut: false, canceled: false };
-async function fakeWorld({ events = [], limits = {} } = {}) {
+async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = '' } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hb-fake-svc-')), runs = join(root, 'runs'), sock = join(root, 'hb.sock'), calls = [];
   mkdirSync(runs);
   const hb = {
@@ -362,14 +362,15 @@ async function fakeWorld({ events = [], limits = {} } = {}) {
       calls.push({ scoped, h, ...o });
       o.onStart();
       for (const e of typeof events === 'function' ? events() : events) o.onEvent(e, { stage: '' });
+      if (output) writeFileSync(join(o.dir, 'out.txt'), output);
       return { ...FAKE_RESULT };
     },
     exec: async () => ({ code: 0, out: '{}', why: null }),
   };
-  const svc = createService({ hb, harnesses: ROWS, runs, limits,
+  const svc = createService({ hb, harnesses, runs, limits,
     clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appc', tokenSha256: hex(TOKEN.c), webSearch: true, events: true }] });
   await new Promise((r) => svc.server.listen(sock, r));
-  return { runs, calls, a: harnessbox({ socketPath: sock, token: TOKEN.a }), c: harnessbox({ socketPath: sock, token: TOKEN.c }),
+  return { runs, map: svc.runs, calls, a: harnessbox({ socketPath: sock, token: TOKEN.a }), c: harnessbox({ socketPath: sock, token: TOKEN.c }),
     close: () => { svc.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
@@ -527,4 +528,71 @@ test('service: eventsCount keeps exactly that many events; one more marks events
       assert.deepEqual([r.result.events.length, r.result.eventsTruncated], [2000, truncated], `${n} small events: the default 2000`);
     } finally { w.close(); }
   }
+});
+
+test('service: a forgotten run lets go of its events, outputs and result, whether the memory cap, the run cap or keepMs forgets it', async () => {
+  const events = Array.from({ length: 30 }, (_, i) => ({ type: 'text', data: `${i}`.padEnd(90, '.') }));
+  // outputs are read through /proc (readOutBytes): on Linux out.txt comes back, elsewhere it is null; either way it is dropped
+  const linux = process.platform === 'linux';
+  let w = await fakeWorld({ events, limits: { keptBytes: 8000 }, output: 'o'.repeat(3000) });
+  try {
+    const run = async () => { const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true, outputs: ['out.txt'] })).id; await w.c.events(id); return id; };
+    const first = await run(), a = w.map.get(first);
+    for (let i = 0; i < 50 && !a.timer; i++) await sleep(20); // the end's bookkeeping follows the end event
+    assert.ok(a.kept && a.result && 'out.txt' in a.outputs && a.timer, 'an ended run holds its fields until it is forgotten');
+    if (linux) assert.equal(Buffer.from(a.outputs['out.txt'], 'base64').length, 3000);
+    const second = await run(), b = w.map.get(second);
+    for (let i = 0; i < 50 && w.map.has(first); i++) await sleep(20);
+    assert.ok(!w.map.has(first), 'two runs of 4410 bytes of events (and 3000 of output on Linux) pass 8000: the first goes');
+    assert.deepEqual([a.kept, a.result, a.outputs, a.validator, a.timer, a.bytes], [null, null, null, null, null, 0], 'and holds nothing large any more');
+    for (let i = 0; i < 50 && !b.timer; i++) await sleep(20);
+    assert.ok(b.kept && b.result && 'out.txt' in b.outputs && b.timer, 'the run that stays keeps everything');
+    if (linux) assert.equal(Buffer.from(b.outputs['out.txt'], 'base64').length, 3000);
+    assert.equal((await w.c.getRun(second)).result.events.length, 30);
+  } finally { w.close(); }
+  w = await fakeWorld({ events, limits: { keptRuns: 1 }, output: 'o' });
+  try {
+    const first = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true, outputs: ['out.txt'] })).id;
+    await w.c.events(first);
+    const a = w.map.get(first);
+    for (let i = 0; i < 50 && !a.timer; i++) await sleep(20);
+    await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x' })).id);
+    assert.deepEqual([w.map.has(first), a.kept, a.outputs, a.timer], [false, null, null, null], 'the run cap forgets the oldest ended run the same way');
+  } finally { w.close(); }
+  w = await fakeWorld({ events, limits: { keepMs: 100 } });
+  try {
+    const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id;
+    await w.c.events(id);
+    const a = w.map.get(id);
+    for (let i = 0; i < 50 && w.map.has(id); i++) await sleep(20);
+    assert.deepEqual([w.map.has(id), a.kept, a.result], [false, null, null], 'keepMs forgets it the same way');
+    await assert.rejects(w.c.getRun(id), { status: 404 });
+  } finally { w.close(); }
+});
+
+test('service: after the memory cap forgets runs, the heap holds about what is accounted, not every run ever kept', () => {
+  // review 2's measurement: 40 runs of wide events (each about 2 MiB in memory), keptBytes 20 MiB, in a process with gc exposed
+  const script = `
+    import { mkdtempSync, mkdirSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path'; import { createHash } from 'node:crypto';
+    import { createService } from ${JSON.stringify(join(HERE, '..', 'src', 'server.mjs'))}; import { harnessbox } from ${JSON.stringify(join(HERE, '..', 'src', 'client.mjs'))};
+    const root = mkdtempSync(join(tmpdir(), 'hb-heap-')), runs = join(root, 'runs'), sock = join(root, 's'); mkdirSync(runs);
+    const line = JSON.stringify({ type: 'w', s: '一' + 'a'.repeat(60000) });
+    const hb = { run: async (s, h, o) => { o.onStart(); for (let i = 0; i < 40; i++) o.onEvent(JSON.parse(line), { stage: '' }); return { code: 0, text: '', usage: { input: 0, output: 0 }, error: '', stderr: '', why: null, timedOut: false, canceled: false }; } };
+    const token = 'token-of-client-c-0123456789';
+    const svc = createService({ hb, harnesses: [{ id: 'codex', name: 'Codex', usable: true }], runs, limits: { keptBytes: 20 * 2 ** 20 },
+      clients: [{ id: 'appc', tokenSha256: createHash('sha256').update(token).digest('hex'), events: true }] });
+    await new Promise((r) => svc.server.listen(sock, r));
+    const c = harnessbox({ socketPath: sock, token }), settle = async () => { for (let k = 0; k < 3; k++) { globalThis.gc(); await new Promise((r) => setTimeout(r, 100)); } };
+    await settle();
+    const h0 = process.memoryUsage().heapUsed;
+    for (let i = 0; i < 40; i++) await c.events((await c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id);
+    await new Promise((r) => setTimeout(r, 300)); await settle();
+    let accounted = 0; for (const r of svc.runs.values()) accounted += r.bytes ?? 0;
+    console.log(JSON.stringify({ kept: svc.runs.size, accounted, heap: process.memoryUsage().heapUsed - h0 }));
+    svc.close(); process.exit(0);`;
+  const r = spawnSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', script], { encoding: 'utf8', timeout: 120e3 });
+  assert.equal(r.status, 0, r.stderr);
+  const m = JSON.parse(r.stdout.trim().split('\n').at(-1));
+  assert.ok(m.kept < 40 && m.accounted <= 20 * 2 ** 20, JSON.stringify(m));
+  assert.ok(m.heap < m.accounted * 1.5, `heap grew ${(m.heap / 2 ** 20).toFixed(1)} MiB for ${(m.accounted / 2 ** 20).toFixed(1)} MiB accounted`);
 });

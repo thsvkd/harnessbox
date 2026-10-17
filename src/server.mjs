@@ -126,6 +126,18 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       try { return JSON.stringify({ ...s, ...(s.result ? { result: { ...s.result, events: [], eventsTruncated: true } } : {}) }); } catch { return JSON.stringify({ id: r.id, state: r.state, error: 'the run could not be serialized' }); }
     }
   };
+  // an ended run leaves the map and lets go of what it holds: its expiry timer is cleared (it would keep the run for keepMs) and the
+  // large fields are dropped, so nothing that still refers to the object keeps them. Never an active run; one whose end event is
+  // not sent yet (execute()'s finally) only leaves the map, and its finally lets go after the end event.
+  const forget = (x) => {
+    if (ACTIVE.has(x.state)) return;
+    if (runs.get(x.id) === x) runs.delete(x.id);
+    if (!x.final) return;
+    clearTimeout(x.timer);
+    Object.assign(x, { timer: null, kept: null, result: null, outputs: null, validator: null, bytes: 0 });
+  };
+  // the timer's closure holds only the id (made here, not inside execute(), whose closures share a context that holds the run)
+  const expire = (id) => setTimeout(() => { const x = runs.get(id); if (x) forget(x); }, L.keepMs).unref();
   const emit = (r, event) => { for (const l of r.listeners) { try { l(event); } catch { /* one subscriber cannot end the run or the service */ } } };
   const set = (r, state) => { if (r.state === state || !ACTIVE.has(r.state)) return; r.state = state; if (state === 'running') r.startedAt = new Date().toISOString(); emit(r, 'state'); };
   async function createRun(c, b) {
@@ -159,7 +171,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     if (mine.length >= L.keptRuns) {
       const old = mine.find((r) => !ACTIVE.has(r.state)); // the oldest ended one makes room
       if (!old) no(429, 'too_many_runs', 'too many runs');
-      runs.delete(old.id);
+      forget(old);
     }
 
     // the folder: work/ is the box's /work; readonly folders are written beside it (ro/) and bound read-only over work/<folder>
@@ -265,12 +277,13 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       log(`run client=${r.client} run=${r.id} ${r.state}`);
       emit(r, 'end');
       r.listeners.clear();
-      setTimeout(() => runs.delete(r.id), L.keepMs).unref();
+      r.final = true;
+      if (runs.get(r.id) === r) r.timer = expire(r.id); else forget(r); // forgotten before its end event
       // ended runs hold their outputs (and kept events) in memory: past keptBytes for everybody, the oldest ended runs go first
       r.bytes ??= r.kept?.mem ?? 0;
       let kept = 0;
       for (const x of runs.values()) kept += x.bytes ?? 0;
-      for (const x of runs.values()) { if (kept <= L.keptBytes) break; if (!ACTIVE.has(x.state)) { kept -= x.bytes ?? 0; runs.delete(x.id); } }
+      for (const x of runs.values()) { if (kept <= L.keptBytes) break; if (!ACTIVE.has(x.state)) { kept -= x.bytes ?? 0; forget(x); } }
     }
   }
   const runOf = (c, id) => { const r = runs.get(id); return r && r.client === c.id ? r : no(404, 'unknown_run', 'no such run (a restart forgets runs)'); };
