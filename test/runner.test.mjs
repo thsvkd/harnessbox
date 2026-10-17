@@ -389,10 +389,44 @@ test('run: each harness\'s hardened command in the user\'s own box, cleared envi
       r = await w.hb.run('alice', id, { prompt: 'FAKE_MODE=junk', dir: w.job(), onEvent: () => { throw new Error('a caller bug'); } });
       assert.deepEqual([r.code, r.text, r.usage], [0, 'done (junk)', expect[id]], id);
     }
+    // onEvent sees objects only: the null, "text", [1] and 7 lines are not events
+    for (const id of IDS) {
+      const seen = [];
+      await w.hb.run('alice', id, { prompt: 'FAKE_MODE=junk', dir: w.job(), onEvent: (e) => { seen.push(e); } });
+      assert.ok(seen.length > 1 && seen.every((e) => e && typeof e === 'object' && !Array.isArray(e)), `${id}: ${JSON.stringify(seen)}`);
+      assert.ok(seen.some((e) => e.result === 'junk'), id);
+    }
     const ac = new AbortController();
     ac.abort();
     r = await w.hb.run('alice', 'codex', { prompt: 'x', dir: w.job(), signal: ac.signal });
     assert.deepEqual([r.canceled, r.code], [true, -1], 'aborted before it started: no box');
+  } finally { w.close(); }
+});
+
+test('run: webSearch reaches each adapter\'s command in the box (Claude Code: WebSearch allowed, WebFetch and MCP denied; Codex: web_search=live); Grok refuses it', BOX, async () => {
+  const w = await world();
+  try {
+    const rows = await w.hb.detect();
+    assert.deepEqual(rows.map((r) => [r.id, r.webSearch]), [['claude-code', true], ['codex', true], ['grok', false]]);
+    for (const id of IDS) w.logIn('alice', id);
+    const argsOf = async (id, more) => { const dir = w.job(); const r = await w.hb.run('alice', id, { prompt: 'x', dir, ...more }); assert.equal(r.code, 0, id); return w.seen(dir).args; };
+    for (const more of [{}, { webSearch: false }]) {
+      const c = await argsOf('claude-code', more), x = await argsOf('codex', more);
+      assert.deepEqual(c.slice(c.indexOf('--disallowedTools'), c.indexOf('--disallowedTools') + 4), ['--disallowedTools', 'WebFetch', 'WebSearch', 'mcp__*']);
+      assert.ok(!c.includes('--allowedTools'));
+      assert.ok(x.includes('web_search=disabled') && !x.includes('web_search=live'));
+      assert.deepEqual(x.slice(-3), ['-c', 'web_search=disabled', '-']);
+    }
+    // the caller's -c web_search=live comes before the adapter's last web_search=disabled (Codex takes the last -c for a key)
+    const late = await argsOf('codex', { args: ['-c', 'web_search=live'] });
+    assert.deepEqual(late.slice(-5), ['-c', 'web_search=live', '-c', 'web_search=disabled', '-']);
+    const c = await argsOf('claude-code', { webSearch: true, args: ['--allowedTools', 'Read(//work/**)'] });
+    assert.deepEqual(c.slice(c.indexOf('--allowedTools'), c.indexOf('--allowedTools') + 6), ['--allowedTools', 'WebSearch', '--disallowedTools', 'WebFetch', 'mcp__*', '--strict-mcp-config']);
+    assert.deepEqual(c.slice(-2), ['--allowedTools', 'Read(//work/**)'], 'the caller\'s own rules follow');
+    const x = await argsOf('codex', { webSearch: true });
+    assert.ok(x.includes('web_search=live') && !x.includes('web_search=disabled') && x.includes('sandbox_workspace_write.network_access=false'));
+    await assert.rejects(w.hb.run('alice', 'grok', { prompt: 'x', dir: w.job(), webSearch: true }), /Grok has no web search/);
+    await assert.rejects(w.hb.run('alice', 'codex', { prompt: 'x', dir: w.job(), webSearch: 'yes' }), /webSearch must be true or false/);
   } finally { w.close(); }
 });
 

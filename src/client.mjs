@@ -39,7 +39,7 @@ export function harnessbox({ socketPath, url, token }) {
     cancelLogin: (user, h) => call('DELETE', `${u(user, h)}/login`),
     logout: (user, h) => call('POST', `${u(user, h)}/logout`),
     purge: (user) => call('DELETE', `/v1/users/${encodeURIComponent(user)}`),
-    /** body: { user, harness, prompt, model?, files: [{ path, base64 | text }], readonly?, outputs?, validate?, timeoutMs?, args? } */
+    /** body: { user, harness, prompt, model?, files: [{ path, base64 | text }], readonly?, outputs?, validate?, timeoutMs?, args?, webSearch?, events? } */
     run: (body) => call('POST', '/v1/runs', body),
     getRun: (id) => call('GET', `/v1/runs/${encodeURIComponent(id)}`),
     cancelRun: (id) => call('DELETE', `/v1/runs/${encodeURIComponent(id)}`),
@@ -55,7 +55,12 @@ export function harnessbox({ socketPath, url, token }) {
           for (let i; (i = buf.indexOf('\n\n')) >= 0;) {
             const block = buf.slice(0, i);
             buf = buf.slice(i + 2);
-            const event = /^event: (.+)$/m.exec(block)?.[1], data = /^data: (.+)$/m.exec(block)?.[1];
+            // lines end at \n only: a regex's . and $ would also end one at U+2028 or U+2029, which JSON strings may hold raw
+            let event = '', data = '';
+            for (const l of block.split('\n')) {
+              if (l.startsWith('event: ')) event = l.slice(7);
+              else if (l.startsWith('data: ')) data = l.slice(6);
+            }
             if (!event || !data) continue;
             let run;
             try { run = JSON.parse(data); } catch {

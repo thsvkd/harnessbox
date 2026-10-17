@@ -10,17 +10,30 @@ export interface RunFile { path: string; base64?: string; text?: string; copies?
 export interface RunRequest {
   user: string; harness: string; prompt: string; model?: string; files?: RunFile[]; readonly?: string[]; outputs?: string[];
   validate?: { argv: string[]; net?: 'none'; timeoutMs?: number }; timeoutMs?: number; args?: string[];
+  /** The CLI's own server-side web search (Claude Code, Codex); only for a client whose entry has webSearch: true. */
+  webSearch?: boolean;
+  /** Keep the CLI's JSON events in result.events; only for a client whose entry has events: true. */
+  events?: boolean;
 }
 export interface Run {
   id: string; user: string; harness: string; model: string | null; state: 'queued' | 'running' | 'validating' | 'done' | 'failed' | 'canceled';
   createdAt: string; startedAt: string | null; endedAt: string | null; stage: string; events: number; error?: string;
-  result: { code: number; text: string; usage: { input: number; output: number; unknown?: true }; error: string; stderr: string; why: string | null; timedOut: boolean; canceled: boolean; loggedIn?: boolean } | null;
+  result: {
+    code: number; text: string; usage: { input: number; output: number; unknown?: true }; error: string; stderr: string; why: string | null; timedOut: boolean; canceled: boolean; loggedIn?: boolean;
+    /** With events: true: the CLI's stdout lines that parsed as JSON objects, each serialized again from the parsed object (numbers
+     *  normalized, a repeated key's last value; fields from the box: validate before use), the first 2000 and 1 MiB; an event over
+     *  64 KiB or nested deeper than 64 levels is { type, truncated: true }. */
+    events?: Record<string, any>[];
+    /** With events: true: events past the 2000 or the 1 MiB were dropped. */
+    eventsTruncated?: boolean;
+  } | null;
   validator: { code: number; out: string; why: string | null } | null;
   /** base64 per requested path; null when missing, a link or too big. Present on GET and the end event. */
   outputs?: Record<string, string | null> | null;
 }
 export interface Harnessbox {
-  harnesses(): Promise<{ harnesses: { id: string; name: string; version: string | null; usable: boolean; why: string | null }[] }>;
+  /** webSearch: the harness's adapter supports webSearch (whether this client may use it is its entry's webSearch). */
+  harnesses(): Promise<{ harnesses: { id: string; name: string; version: string | null; usable: boolean; why: string | null; webSearch: boolean }[] }>;
   statuses(user: string): Promise<{ harnesses: HarnessStatus[] }>;
   status(user: string, harness: string): Promise<HarnessStatus>;
   login(user: string, harness: string): Promise<LoginView>;

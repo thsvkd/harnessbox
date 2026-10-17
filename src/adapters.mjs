@@ -21,10 +21,13 @@ import { join } from 'node:path';
  * @property {{args: string[], parse(r: {code: number, out: string}): {loggedIn: boolean, method?: string|null, plan?: string|null}}} status
  * @property {string[]} logout  args
  * @property {RegExp} [expired]  a failed run's output that means the login is gone
- * @property {{command(o: {prompt: string, dir: string, has: Set<string>, extra: string[]}): {args: string[], stdin?: string},
+ * @property {boolean} [webSearch]  job.command turns on the CLI's own server-side web search when asked (o.webSearch); the box's hosts
+ *   stay the same. Without it a run with webSearch is refused.
+ * @property {{command(o: {prompt: string, dir: string, has: Set<string>, extra: string[], webSearch: boolean}): {args: string[], stdin?: string},
  *   event(e: any, acc: {text: string, usage: {input: number, output: number}, reports: number, error: string, stage: string}): void,
  *   finish?(acc: object, o: {dir: string, readOut: Function}): Promise<void>}} job
- *   event sees each JSON line of stdout; reports counts usage reports (none: the usage is marked unknown)
+ *   event sees each line of stdout that parses as a JSON object (not an array or a scalar); reports counts usage reports (none: the
+ *   usage is marked unknown)
  */
 
 const URL_RE = /https:\/\/[^\s"'<>`]+/;
@@ -35,6 +38,8 @@ const deviceCode = (t) => {
   return code ? { url, code } : null;
 };
 const n = (x) => (Number.isFinite(x) ? x : 0); // a usage number from the box, or 0
+/** s cut to at most max UTF-16 units, never between the two halves of a surrogate pair (text from the box, for a stage or an error) */
+export const clip = (s, max) => { const t = s.slice(0, max); return s.length > max && /[\ud800-\udbff]$/.test(t) ? t.slice(0, -1) : t; };
 const EXPIRED = /Login expired|Not logged in|Please run \/login|invalid_grant|token (has )?expired|401 Unauthorized/i;
 
 // ~/.claude.json keeps Claude Code's account record next to user-scope settings a box could plant (mcpServers, per-folder trust under
@@ -45,7 +50,10 @@ const CLAUDE_ACCOUNT = ['oauthAccount', 'userID', 'hasCompletedOnboarding', 'las
  * Claude Code. Login: `claude auth login` prints a URL and waits for the code the login page shows on stdin. Job: --restricted ignores
  * the user, project and local settings files (so their hooks too); --strict-mcp-config with no config: no MCP server;
  * --no-session-persistence keeps the session out of ~/.claude/projects; dontAsk refuses every tool use no allow rule covers (the
- * caller adds --tools/--allowedTools rules in args, as absolute `//path` rules: a `./` rule moves with a Bash `cd`).
+ * caller adds --tools/--allowedTools rules in args, as absolute `//path` rules: a `./` rule moves with a Bash `cd`). WebFetch, WebSearch
+ * and every MCP tool are denied; with webSearch, WebSearch (Anthropic's server-side search: titles and URLs, no page fetch) leaves the
+ * deny list and gets an allow rule, since dontAsk refuses a tool no rule allows. Both lists come before the three flags, so the
+ * caller's args never start inside one.
  * @type {Adapter}
  */
 export const claudeCode = {
@@ -66,9 +74,13 @@ export const claudeCode = {
   },
   logout: ['auth', 'logout'],
   expired: EXPIRED,
+  webSearch: true,
   job: {
-    command: ({ prompt, extra }) => ({ args: ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk', '--strict-mcp-config', '--restricted',
-      '--no-session-persistence', '--disallowedTools', 'WebFetch', 'WebSearch', 'mcp__*', ...extra] }),
+    // --disallowedTools and --allowedTools take every value up to the next option: the caller's options never follow them directly
+    // (a leading Read would join the deny list, or with webSearch the allow list), the three flags without a value come between
+    command: ({ prompt, extra, webSearch }) => ({ args: ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'dontAsk',
+      ...(webSearch ? ['--allowedTools', 'WebSearch', '--disallowedTools', 'WebFetch', 'mcp__*'] : ['--disallowedTools', 'WebFetch', 'WebSearch', 'mcp__*']),
+      '--strict-mcp-config', '--restricted', '--no-session-persistence', ...extra] }),
     // every result event counts (with a background Agent a run ends a turn and the Agent's notice opens another, each with a result of
     // its own usage); input counts the cache too; the last result is the model's last message; one marked as an error says why
     event: (e, acc) => {
@@ -78,7 +90,7 @@ export const claudeCode = {
       acc.usage.input += n(u.input_tokens) + n(u.cache_creation_input_tokens) + n(u.cache_read_input_tokens);
       acc.usage.output += n(u.output_tokens);
       if (typeof e.result === 'string') acc.text = e.result;
-      if (e.is_error === true && typeof e.result === 'string') acc.error = e.result.replace(/\s+/g, ' ').trim().slice(0, 200);
+      if (e.is_error === true && typeof e.result === 'string') acc.error = clip(e.result.replace(/\s+/g, ' ').trim(), 200);
     },
   },
 };
@@ -89,7 +101,9 @@ const CODEX_STAGE = { command_execution: 'command', file_change: 'file change', 
  * Codex. Credentials always in ~/.codex/auth.json, never a keyring (the box has no D-Bus). Login: `codex login --device-auth` prints
  * a URL and a one-time code, then polls until the user confirms (the user or workspace admin must allow device-code login). Job:
  * the user's config.toml and execpolicy rules are not read; the sandbox's network, MCP servers, apps, remote plugins, web search and
- * the user's skills list are off; workspace-write may not write /tmp or $TMPDIR. Its own sandbox needs user namespaces: nested.
+ * the user's skills list are off; workspace-write may not write /tmp or $TMPDIR. Its own sandbox needs user namespaces: nested. With
+ * webSearch, web_search=live instead of disabled: the Responses API's hosted web_search tool, run by OpenAI (the sandbox's network
+ * stays off). Without it, web_search=disabled once more after the caller's args.
  * @type {Adapter}
  */
 export const codex = {
@@ -103,19 +117,23 @@ export const codex = {
   status: { args: ['login', 'status'], parse: ({ code, out }) => ({ loggedIn: code === 0, method: code !== 0 ? null : /ChatGPT/.test(out) ? 'chatgpt' : /API key/i.test(out) ? 'api-key' : null, plan: null }) },
   logout: ['logout'],
   expired: EXPIRED,
+  webSearch: true,
   job: {
-    command: ({ prompt, dir, has, extra }) => ({
+    command: ({ prompt, dir, has, extra, webSearch }) => ({
       args: ['exec', '--skip-git-repo-check', '--ignore-user-config', ...(has.has('--ignore-rules') ? ['--ignore-rules'] : []), '-C', dir, '-s', 'workspace-write',
         '-c', 'approval_policy=never', '-c', 'sandbox_workspace_write.network_access=false',
         '-c', 'sandbox_workspace_write.exclude_slash_tmp=true', '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true', '-c', 'mcp_servers={}',
-        '-c', 'features.apps=false', '-c', 'features.plugins=false', '-c', 'features.remote_plugin=false', '-c', 'web_search=disabled', '-c', 'skills.include_instructions=false',
-        '--disable', 'plugins', '--disable', 'apps', '--ephemeral', '--json', '-o', join(dir, CODEX_LAST), ...extra, '-'],
+        '-c', 'features.apps=false', '-c', 'features.plugins=false', '-c', 'features.remote_plugin=false', '-c', webSearch ? 'web_search=live' : 'web_search=disabled', '-c', 'skills.include_instructions=false',
+        '--disable', 'plugins', '--disable', 'apps', '--ephemeral', '--json', '-o', join(dir, CODEX_LAST), ...extra,
+        // the last -c for a key wins: without webSearch, the caller's args cannot set web_search again
+        ...(webSearch ? [] : ['-c', 'web_search=disabled']), '-'],
       stdin: prompt,
     }),
     event: (e, acc) => {
-      if (e.item?.type) acc.stage = CODEX_STAGE[e.item.type] ?? String(e.item.type).slice(0, 40);
+      // own keys only: an item type such as constructor or __proto__ must not read Object.prototype
+      if (e.item?.type) acc.stage = typeof e.item.type === 'string' && Object.hasOwn(CODEX_STAGE, e.item.type) ? CODEX_STAGE[e.item.type] : clip(String(e.item.type), 40);
       if (e.type === 'turn.completed' && e.usage) { acc.reports++; acc.usage.input += n(e.usage.input_tokens); acc.usage.output += n(e.usage.output_tokens); }
-      if (e.type === 'error' && typeof e.message === 'string') acc.error = e.message.slice(0, 200);
+      if (e.type === 'error' && typeof e.message === 'string') acc.error = clip(e.message, 200);
     },
     // the last message, from the file -o wrote in the job folder (readOut: never through a link the box made)
     finish: async (acc, { dir, readOut }) => { acc.text = (await readOut(dir, CODEX_LAST)) ?? acc.text; },
@@ -182,7 +200,7 @@ export const grok = {
         acc.usage.input += n(u.input_tokens) + n(u.cache_read_input_tokens) + n(u.cache_creation_input_tokens);
         acc.usage.output += n(u.output_tokens);
       }
-      if (e.type === 'error' && typeof e.message === 'string') acc.error = e.message.replace(/\s+/g, ' ').trim().slice(0, 200);
+      if (e.type === 'error' && typeof e.message === 'string') acc.error = clip(e.message.replace(/\s+/g, ' ').trim(), 200);
     },
   },
 };

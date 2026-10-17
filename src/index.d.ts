@@ -31,8 +31,10 @@ export interface Adapter {
   status: { args: readonly string[]; parse(result: ShortResult): Omit<Status, 'installed'> };
   logout: readonly string[];
   expired?: RegExp;
+  /** job.command turns on the CLI's own server-side web search when options.webSearch is true; without it such a run is refused. */
+  webSearch?: boolean;
   job: {
-    command(options: { prompt: string; dir: string; has: Set<string>; extra: readonly string[] }): { args: readonly string[]; stdin?: string };
+    command(options: { prompt: string; dir: string; has: Set<string>; extra: readonly string[]; webSearch: boolean }): { args: readonly string[]; stdin?: string };
     event(event: JsonEvent, acc: Accumulator): void;
     finish?(acc: Accumulator, options: { dir: string; readOut: typeof readOut }): Promise<void>;
   };
@@ -45,6 +47,8 @@ export interface RunnerOptions {
 }
 export interface DetectRow {
   id: string; name: string; bin: string | null; version: string | null; usable: boolean; why: string | null; has: Set<string>;
+  /** The adapter supports webSearch (Adapter.webSearch). */
+  webSearch: boolean;
 }
 export interface RunOptions {
   prompt: string; dir: string; timeoutMs?: number; args?: readonly string[]; env?: Env;
@@ -57,6 +61,8 @@ export interface RunOptions {
   onStart?: () => void;
   /** Notifications are fire-and-forget; synchronous errors and rejected promises are contained. */
   onEvent?: (event: JsonEvent, info: { stage: string }) => void | Promise<void>;
+  /** The CLI's own server-side web search on (adapters with webSearch only; default false). The box's hosts stay the same. */
+  webSearch?: boolean;
 }
 export interface RunResult {
   code: number; text: string; usage: Usage; error: string; stderr: string; why: string | null;

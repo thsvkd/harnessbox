@@ -8,7 +8,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { dirname, join } from 'node:path';
-import { claudeCode, codex, grok } from './adapters.mjs';
+import { claudeCode, clip, codex, grok } from './adapters.mjs';
 import { ID, readOutBytes } from './box.mjs';
 import { Busy, createRunner } from './runner.mjs';
 
@@ -16,7 +16,7 @@ import { Busy, createRunner } from './runner.mjs';
 export const BOX_DIR = '/work';
 export const LIMITS = {
   body: 64 * 2 ** 20, prompt: 256 * 1024, files: 2000, filesBytes: 48 * 2 ** 20, outputs: 32, output: 2 * 2 ** 20, outputsBytes: 16 * 2 ** 20,
-  activeRuns: 16, keptRuns: 200, keptBytes: 256 * 2 ** 20, inflightBytes: 128 * 2 ** 20, streams: 32, logins: 4, runTimeoutMs: 2 * 3600e3, validateMs: 10 * 60e3, keepMs: 30 * 60e3, statusFreshMs: 30e3, readyMs: 30e3,
+  eventsBytes: 2 ** 20, eventBytes: 64 * 1024, eventDepth: 64, eventsCount: 2000, activeRuns: 16, keptRuns: 200, keptBytes: 256 * 2 ** 20, inflightBytes: 128 * 2 ** 20, streams: 32, logins: 4, runTimeoutMs: 2 * 3600e3, validateMs: 10 * 60e3, keepMs: 30 * 60e3, statusFreshMs: 30e3, readyMs: 30e3,
 };
 const CODE = /^[\x21-\x7e]{1,2048}$/, MODEL = /^[A-Za-z0-9._:@/-]{1,100}$/;
 const ACTIVE = new Set(['queued', 'running', 'validating']);
@@ -33,11 +33,16 @@ const strings = (v, max, what) => {
   return v;
 };
 
+// Claude Code reads a --settings value as inline JSON when, trimmed, it starts with { and ends with }, else as a file path (2.1.300).
+// Inline here: a value whose trim parses as a JSON object, which Claude always reads inline; anything else counts as a file.
+const jsonObject = (v) => { try { const j = JSON.parse(v.trim()); return j !== null && typeof j === 'object' && !Array.isArray(j); } catch { return false; } };
+
 /**
  * @param {object} o
  * @param {ReturnType<typeof createRunner> extends Promise<infer R> ? R : never} o.hb  the runner (createRunner), already detected
- * @param {{id: string, name: string, version: string|null, usable: boolean, why: string|null}[]} o.harnesses  hb.detect()'s rows
- * @param {{id: string, tokenSha256: string, harnesses?: string[]}[]} o.clients
+ * @param {{id: string, name: string, version: string|null, usable: boolean, why: string|null, webSearch?: boolean}[]} o.harnesses  hb.detect()'s rows
+ * @param {{id: string, tokenSha256: string, harnesses?: string[], webSearch?: boolean, events?: boolean}[]} o.clients  webSearch, events: what
+ *   its runs may ask for (default false)
  * @param {string} o.runs  folder for the run folders (a tmpfs); emptied by main() at start
  * @param {Record<string, string[]>} [o.models]  allowed models per harness id (absent: any well-formed name)
  * @param {Partial<typeof LIMITS>} [o.limits]
@@ -48,7 +53,8 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   const known = new Map(harnesses.map((h) => [h.id, h]));
   const keys = clients.map((c) => {
     if (!ID.test(c.id ?? '') || !/^[0-9a-f]{64}$/.test(c.tokenSha256 ?? '')) throw new Error(`bad client entry ${c.id}`);
-    return { id: c.id, hash: Buffer.from(c.tokenSha256, 'hex'), harnesses: c.harnesses ? new Set(c.harnesses) : null };
+    for (const k of ['webSearch', 'events']) if (c[k] !== undefined && typeof c[k] !== 'boolean') throw new Error(`bad client entry ${c.id}: ${k} must be true or false`);
+    return { id: c.id, hash: Buffer.from(c.tokenSha256, 'hex'), harnesses: c.harnesses ? new Set(c.harnesses) : null, webSearch: c.webSearch === true, events: c.events === true };
   });
   const auth = (req) => {
     const m = /^Bearer (\S{16,512})$/.exec(req.headers.authorization ?? '');
@@ -111,16 +117,58 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     id: r.id, user: r.user, harness: r.harness, model: r.model, state: r.state, createdAt: r.createdAt, startedAt: r.startedAt, endedAt: r.endedAt,
     stage: r.stage, events: r.events, ...(r.error ? { error: r.error } : {}), result: r.result, validator: r.validator, ...(full ? { outputs: r.outputs } : {}),
   });
-  const emit = (r, event) => { for (const l of r.listeners) l(event); };
+  // a run as JSON. Kept events are JSON text already (keep()), spliced in where result.events holds MARK: never parsed or serialized
+  // again. Never throws (this runs in execute()'s finally, through emit): past a failure, the run without its events
+  // (eventsTruncated) or, last, its id and state. U+2028 and U+2029, which JSON.stringify leaves raw and which only occur inside JSON
+  // strings, are written as \u2028 and \u2029: the same JSON, and an SSE client that splits lines on them (as 0.3.0's client did) still
+  // reads one data line.
+  const MARK = `hb-events-${randomBytes(12).toString('hex')}`;
+  const seps = (t) => t.replace(/[\u2028\u2029]/g, (ch) => (ch === '\u2028' ? '\\u2028' : '\\u2029'));
+  const runJson = (r, full = true) => {
+    const s = snapshot(r, full);
+    try {
+      const t = JSON.stringify(s), i = r.kept && s.result ? t.indexOf(`"${MARK}"`) : -1;
+      return seps(i < 0 ? t : `${t.slice(0, i)}[${r.kept.list.join(',')}]${t.slice(i + MARK.length + 2)}`);
+    } catch {
+      try { return seps(JSON.stringify({ ...s, ...(s.result ? { result: { ...s.result, events: [], eventsTruncated: true } } : {}) })); } catch { return JSON.stringify({ id: r.id, state: r.state, error: 'the run could not be serialized' }); }
+    }
+  };
+  // an ended run leaves the map and lets go of what it holds: its expiry timer is cleared (it would keep the run for keepMs) and the
+  // large fields are dropped, so nothing that still refers to the object keeps them. Never an active run; one whose end event is
+  // not sent yet (execute()'s finally) only leaves the map, and its finally lets go after the end event.
+  const forget = (x) => {
+    if (ACTIVE.has(x.state)) return;
+    if (runs.get(x.id) === x) runs.delete(x.id);
+    if (!x.final) return;
+    clearTimeout(x.timer);
+    Object.assign(x, { timer: null, kept: null, result: null, outputs: null, validator: null, bytes: 0 });
+  };
+  // the timer's closure holds only the id (made here, not inside execute(), whose closures share a context that holds the run)
+  const expire = (id) => setTimeout(() => { const x = runs.get(id); if (x) forget(x); }, L.keepMs).unref();
+  const emit = (r, event) => { for (const l of r.listeners) { try { l(event); } catch { /* one subscriber cannot end the run or the service */ } } };
   const set = (r, state) => { if (r.state === state || !ACTIVE.has(r.state)) return; r.state = state; if (state === 'running') r.startedAt = new Date().toISOString(); emit(r, 'state'); };
   async function createRun(c, b) {
     if (!b || typeof b !== 'object') no(400, 'bad_request', 'a JSON object is required');
     const scoped = userOf(c, b.user), h = harnessOf(c, b.harness).id;
     if (typeof b.prompt !== 'string' || !b.prompt || b.prompt.startsWith('-') || b.prompt.includes('\0') || Buffer.byteLength(b.prompt) > L.prompt) no(400, 'bad_prompt', `prompt: a string of at most ${L.prompt} bytes, not starting with "-"`);
-    if (b.model != null && (typeof b.model !== 'string' || !MODEL.test(b.model) || (models[h] && !models[h].includes(b.model)))) no(400, 'bad_model', `model not allowed for ${h}`);
+    if (b.model != null && (typeof b.model !== 'string' || !MODEL.test(b.model) || (Object.hasOwn(models, h) && !models[h].includes(b.model)))) no(400, 'bad_model', `model not allowed for ${h}`);
     const timeoutMs = b.timeoutMs ?? 40 * 60e3;
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > L.runTimeoutMs) no(400, 'bad_timeout', `timeoutMs: 1000..${L.runTimeoutMs}`);
+    // webSearch and events: off unless the client's entry allows them; false or absent is the run as before
+    for (const k of ['webSearch', 'events']) if (b[k] != null && typeof b[k] !== 'boolean') no(400, 'bad_request', `${k}: true or false`);
+    if (b.webSearch && !c.webSearch) no(400, 'web_search_not_allowed', 'webSearch is not allowed for this client');
+    if (b.webSearch && !known.get(h).webSearch) no(400, 'web_search_unsupported', `${known.get(h).name} does not support webSearch on this service`);
+    if (b.events && !c.events) no(400, 'events_not_allowed', 'events is not allowed for this client');
     const args = strings(b.args, 64, 'args'), outputs = strings(b.outputs, L.outputs, 'outputs'), readonly = strings(b.readonly, 16, 'readonly');
+    // nor through its CLI options. The adapters hold the line (Codex: web_search=disabled again after the caller's args, and the last -c
+    // wins; Claude Code: --disallowedTools WebSearch, and a deny beats any allow); on top, an element that names web search is refused,
+    // even in a prompt-like value or a deny rule. Other options that widen the CLI are not checked (docs/service.md).
+    if (!c.webSearch && args.some((a) => /web[\s_-]?search/i.test(a))) no(400, 'web_search_not_allowed', 'args may not name web search for this client');
+    // a check by spelling only: TOML and JSON \u and \U escapes (always hex digits: a Windows path's \Users is none) and a --settings
+    // file could spell it otherwise, so those are refused too
+    if (!c.webSearch && args.some((a, i) => /\\u[0-9a-f]{4}/i.test(a) || (a === '--settings' && !jsonObject(args[i + 1])) || (a.startsWith('--settings=') && !jsonObject(a.slice(11))))) {
+      no(400, 'bad_args', 'args may not carry \\u escapes or a --settings file for this client');
+    }
     if (![...outputs, ...readonly].every(safePath) || new Set(outputs).size !== outputs.length) no(400, 'bad_path', 'outputs and readonly are distinct relative paths');
     if (readonly.some((p) => readonly.some((q) => q !== p && (q.startsWith(`${p}/`) || q === p)))) no(400, 'bad_path', 'readonly folders may not overlap');
     let validate = null;
@@ -136,7 +184,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     if (mine.length >= L.keptRuns) {
       const old = mine.find((r) => !ACTIVE.has(r.state)); // the oldest ended one makes room
       if (!old) no(429, 'too_many_runs', 'too many runs');
-      runs.delete(old.id);
+      forget(old);
     }
 
     // the folder: work/ is the box's /work; readonly folders are written beside it (ro/) and bound read-only over work/<folder>
@@ -144,6 +192,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     const r = {
       id, client: c.id, user: b.user, scoped, harness: h, model: b.model ?? null, state: 'queued', createdAt: new Date().toISOString(), startedAt: null, endedAt: null,
       stage: '', events: 0, result: null, validator: null, outputs: null, error: null, ac: new AbortController(), listeners: new Set(),
+      kept: b.events ? { list: [], bytes: 0, mem: 0, truncated: false } : null,
     };
     // Reserve admission before the first filesystem await, including concurrent uploads still being staged.
     runs.set(id, r);
@@ -170,23 +219,49 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       for (const p of readonly) await mkdir(join(root, 'ro', p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));
     } catch (e) { runs.delete(id); if (root) await rm(root, { recursive: true, force: true }); throw e; }
     log(`run client=${c.id} run=${id} user=${scoped} harness=${h} queued`);
-    void execute(r, { root, work, prompt: b.prompt, timeoutMs, args, outputs, validate, roBinds: readonly.map((p) => [join(root, 'ro', p), join(BOX_DIR, p)]) });
+    execute(r, { root, work, prompt: b.prompt, timeoutMs, args, outputs, validate, webSearch: b.webSearch === true, roBinds: readonly.map((p) => [join(root, 'ro', p), join(BOX_DIR, p)]) })
+      .catch((e) => log(`error run=${id} ${e?.name ?? 'error'}`)); // never an unhandled rejection: it would end the service
     return r;
   }
-  async function execute(r, { root, work, prompt, timeoutMs, args, outputs, validate, roBinds }) {
+  // events: true keeps the CLI's JSON events for result.events as JSON text, the first L.eventsCount and L.eventsBytes of them (a comma
+  // each). An event that does not serialize (nested past the stack), is over L.eventBytes or nests deeper than L.eventDepth is kept as
+  // { type, truncated: true }: a client that parses and serializes it again must not hit its own stack limit. k.mem is what the texts
+  // take in memory (two bytes a character when one is past U+00FF, plus a string's own header), for keptBytes.
+  const depth = (t) => {
+    let d = 0, max = 0, str = false;
+    for (let i = 0; i < t.length; i++) {
+      const ch = t.charCodeAt(i);
+      if (str) { if (ch === 92) i++; else if (ch === 34) str = false; } else if (ch === 34) str = true;
+      else if (ch === 123 || ch === 91) max = Math.max(max, ++d); else if (ch === 125 || ch === 93) d--;
+    }
+    return max;
+  };
+  const keep = (k, e) => {
+    if (k.truncated || !e || typeof e !== 'object' || Array.isArray(e)) return; // objects only, as the runner passes them
+    let t = null;
+    try { t = JSON.stringify(e); } catch { /* too deep for this stack */ }
+    if (typeof t !== 'string' || Buffer.byteLength(t) > L.eventBytes || depth(t) > L.eventDepth) t = JSON.stringify({ type: typeof e.type === 'string' ? clip(e.type, 100) : null, truncated: true });
+    const size = Buffer.byteLength(t);
+    if (k.list.length >= L.eventsCount || k.bytes + size + 1 > L.eventsBytes) { k.truncated = true; return; }
+    k.bytes += size + 1;
+    k.mem += (/[^\x00-\xff]/.test(t) ? 2 : 1) * t.length + 32;
+    k.list.push(t);
+  };
+  async function execute(r, { root, work, prompt, timeoutMs, args, outputs, validate, webSearch, roBinds }) {
     const signal = r.ac.signal;
     let last = 0;
     try {
       const res = await hb.run(r.scoped, r.harness, {
-        prompt, dir: work, boxDir: BOX_DIR, model: r.model ?? undefined, timeoutMs, args, roBinds, signal,
+        prompt, dir: work, boxDir: BOX_DIR, model: r.model ?? undefined, timeoutMs, args, roBinds, signal, webSearch,
         onStart: () => set(r, 'running'),
         onEvent: (e, { stage }) => {
           r.events++;
-          r.stage = stage || (typeof e.type === 'string' ? e.type.slice(0, 40) : '');
+          if (r.kept) keep(r.kept, e);
+          r.stage = stage || (typeof e?.type === 'string' ? clip(e.type, 40) : '');
           if (Date.now() - last >= 1000) { last = Date.now(); emit(r, 'progress'); }
         },
       });
-      r.result = res;
+      r.result = r.kept ? { ...res, events: MARK, eventsTruncated: r.kept.truncated } : res; // runJson puts the events in
       if (res.loggedIn !== undefined) remember(r.scoped, r.harness, res.loggedIn ? null : { installed: true, loggedIn: false, method: null, plan: null });
       // the validator in a second box, no network, over the same folder and the same read-only binds, with an empty home of its own:
       // the client chose the command, and it must not see the user's credential
@@ -204,7 +279,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
         if (bytes !== null && (total += bytes.length) <= L.outputsBytes) r.outputs[p] = bytes.toString('base64');
         else r.outputs[p] = null;
       }
-      r.bytes = total + Buffer.byteLength(res.text) + Buffer.byteLength(res.stderr) + Buffer.byteLength(r.validator?.out ?? '');
+      r.bytes = total + Buffer.byteLength(res.text) + Buffer.byteLength(res.stderr) + Buffer.byteLength(r.validator?.out ?? '') + (r.kept?.mem ?? 0);
       r.state = signal.aborted || res.canceled ? 'canceled' : res.code === 0 && !res.why ? 'done' : 'failed';
     } catch (e) {
       r.error = String(e.message).slice(0, 300);
@@ -215,11 +290,13 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       log(`run client=${r.client} run=${r.id} ${r.state}`);
       emit(r, 'end');
       r.listeners.clear();
-      setTimeout(() => runs.delete(r.id), L.keepMs).unref();
-      // ended runs hold their outputs in memory: past keptBytes for everybody, the oldest ended runs go first
+      r.final = true;
+      if (runs.get(r.id) === r) r.timer = expire(r.id); else forget(r); // forgotten before its end event
+      // ended runs hold their outputs (and kept events) in memory: past keptBytes for everybody, the oldest ended runs go first
+      r.bytes ??= r.kept?.mem ?? 0;
       let kept = 0;
       for (const x of runs.values()) kept += x.bytes ?? 0;
-      for (const x of runs.values()) { if (kept <= L.keptBytes) break; if (!ACTIVE.has(x.state)) { kept -= x.bytes ?? 0; runs.delete(x.id); } }
+      for (const x of runs.values()) { if (kept <= L.keptBytes) break; if (!ACTIVE.has(x.state)) { kept -= x.bytes ?? 0; forget(x); } }
     }
   }
   const runOf = (c, id) => { const r = runs.get(id); return r && r.client === c.id ? r : no(404, 'unknown_run', 'no such run (a restart forgets runs)'); };
@@ -229,7 +306,8 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     streams.set(c.id, (streams.get(c.id) ?? 0) + 1);
     res.on('close', () => streams.set(c.id, streams.get(c.id) - 1));
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
-    const send = (event) => res.write(`event: ${event}\ndata: ${JSON.stringify(snapshot(r, event === 'end'))}\n\n`);
+    res.on('error', () => {}); // a subscriber gone mid-write is not the service's error
+    const send = (event) => res.write(`event: ${event}\ndata: ${runJson(r, event === 'end')}\n\n`);
     if (!ACTIVE.has(r.state)) { send('end'); return res.end(); }
     send('state');
     const ping = setInterval(() => res.write(': ping\n\n'), 15e3);
@@ -239,8 +317,10 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   }
 
   // ---- HTTP
-  const json = (res, status, body) => {
-    const data = body === undefined ? '' : JSON.stringify(body);
+  /** text: the body as JSON already (runJson) */
+  const json = (res, status, body, text) => {
+    let data;
+    try { data = text ?? (body === undefined ? '' : JSON.stringify(body)); } catch { status = 500; data = JSON.stringify({ error: { code: 'internal', message: 'internal error' } }); }
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(data) });
     res.end(data);
   };
@@ -264,7 +344,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   async function route(req, res) {
     const c = auth(req), url = new URL(req.url, 'http://x'), m = req.method, p = url.pathname.split('/').slice(1).map(decodeURIComponent);
     if (p[0] !== 'v1') no(404, 'not_found', 'not found');
-    if (m === 'GET' && p.length === 2 && p[1] === 'harnesses') return json(res, 200, { harnesses: allowed(c).map(({ id, name, version, usable, why }) => ({ id, name, version, usable, why })) });
+    if (m === 'GET' && p.length === 2 && p[1] === 'harnesses') return json(res, 200, { harnesses: allowed(c).map(({ id, name, version, usable, why, webSearch }) => ({ id, name, version, usable, why, webSearch: webSearch === true })) });
     if (p[1] === 'users' && p.length >= 3) {
       const scoped = userOf(c, p[2]);
       if (p.length === 3 && m === 'DELETE') {
@@ -307,9 +387,9 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       }
     }
     if (p[1] === 'runs') {
-      if (p.length === 2 && m === 'POST') { const r = await createRun(c, await body(c, req)); return json(res, 202, snapshot(r)); }
+      if (p.length === 2 && m === 'POST') { const r = await createRun(c, await body(c, req)); return json(res, 202, undefined, runJson(r)); }
       const r = runOf(c, p[2] ?? '');
-      if (p.length === 3 && m === 'GET') return json(res, 200, snapshot(r));
+      if (p.length === 3 && m === 'GET') return json(res, 200, undefined, runJson(r));
       if (p.length === 3 && m === 'DELETE') {
         r.ac.abort(); // a queued run leaves the user's lock and the slot queue at once; the run ends canceled
         return json(res, 204);

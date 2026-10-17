@@ -1,6 +1,7 @@
 // The service end to end: src/server.mjs on a unix socket, driven through src/client.mjs, over the real runner with real bubblewrap
 // boxes and the fake CLIs (test/fake-cli.mjs). Two clients, their users kept apart; auth; logins; a review-automation-shaped draft
-// job (files in, a read-only skill, out/ files back, a validator in a no-network box); cancel; caps; a restart.
+// job (files in, a read-only skill, out/ files back, a validator in a no-network box); cancel; caps; a restart. webSearch and events
+// per client; the tests over a stand-in runner (fakeWorld) need no bubblewrap.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -17,7 +18,7 @@ const HERE = import.meta.dirname;
 const FAKE = { 'claude-code': join(HERE, 'fake-claude'), codex: join(HERE, 'fake-codex'), grok: join(HERE, 'fake-grok') };
 const canBox = spawnSync('bwrap', ['--unshare-all', '--die-with-parent', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc', '--dev', '/dev', '/usr/bin/true']).status === 0;
 const BOX = { skip: !canBox && 'needs bubblewrap with user namespaces' };
-const TOKEN = { a: 'token-of-client-a-0123456789', b: 'token-of-client-b-0123456789' };
+const TOKEN = { a: 'token-of-client-a-0123456789', b: 'token-of-client-b-0123456789', c: 'token-of-client-c-0123456789' };
 const hex = (t) => createHash('sha256').update(t).digest('hex');
 const CRED = { 'claude-code': '.claude/.credentials.json', codex: '.codex/auth.json', grok: '.grok/auth.json' };
 const b64 = (s) => Buffer.from(s).toString('base64'), unb64 = (s) => (s === null ? null : Buffer.from(s, 'base64').toString());
@@ -28,11 +29,11 @@ async function world({ limits = {}, root = mkdtempSync(join(tmpdir(), 'hb-servic
   mkdirSync(runs, { recursive: true });
   const hb = await createRunner({ homes, adapters: [claudeCode, codex, grok], bins: FAKE, socat: join(HERE, 'fake-socat'), log: (l) => logs.push(l), passEnv: env });
   const svc = createService({ hb, harnesses: await hb.detect(), runs, log: (l) => logs.push(l), limits, models: { codex: ['gpt-5.5-codex'] },
-    clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appb', tokenSha256: hex(TOKEN.b), harnesses: ['claude-code'] }] });
+    clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appb', tokenSha256: hex(TOKEN.b), harnesses: ['claude-code'] }, { id: 'appc', tokenSha256: hex(TOKEN.c), webSearch: true, events: true }] });
   await new Promise((r) => svc.server.listen(sock, r));
   const logIn = (client, user, id) => { const f = join(homes, client, user, id, CRED[id]); mkdirSync(join(f, '..'), { recursive: true }); writeFileSync(f, '{"fake":true}'); };
   return {
-    root, homes, runs, sock, logs, logIn, a: harnessbox({ socketPath: sock, token: TOKEN.a }), b: harnessbox({ socketPath: sock, token: TOKEN.b }),
+    root, homes, runs, sock, logs, logIn, a: harnessbox({ socketPath: sock, token: TOKEN.a }), b: harnessbox({ socketPath: sock, token: TOKEN.b }), c: harnessbox({ socketPath: sock, token: TOKEN.c }),
     close: async ({ keep = false } = {}) => { svc.close(); await hb.close(); if (!keep) rmSync(root, { recursive: true, force: true }); },
   };
 }
@@ -47,7 +48,7 @@ test('service: auth, harness lists per client, logins through the API, status an
   try {
     assert.equal((await raw(w.sock, 'GET', '/v1/harnesses')).status, 401);
     assert.equal((await raw(w.sock, 'GET', '/v1/harnesses', { authorization: 'Bearer not-a-real-token-at-all' })).status, 401);
-    assert.deepEqual((await w.a.harnesses()).harnesses.map((h) => [h.id, h.usable]), [['claude-code', true], ['codex', true], ['grok', true]]);
+    assert.deepEqual((await w.a.harnesses()).harnesses.map((h) => [h.id, h.usable, h.webSearch]), [['claude-code', true, true], ['codex', true, true], ['grok', true, false]]);
     assert.deepEqual((await w.b.harnesses()).harnesses.map((h) => h.id), ['claude-code'], 'a client sees only its harnesses');
     await assert.rejects(w.b.status('u1', 'codex'), { status: 404, code: 'unknown_harness' });
     await assert.rejects(w.a.status('../x', 'codex'), { status: 400, code: 'bad_user' });
@@ -84,6 +85,7 @@ test('service: auth, harness lists per client, logins through the API, status an
   } finally { await w.close(); }
 });
 
+const RESULT_020 = ['code', 'text', 'usage', 'error', 'stderr', 'why', 'timedOut', 'canceled'];
 const draftJob = (user, harness, more = {}) => ({
   user, harness, prompt: `Read ${BOX_DIR}/request.md. FAKE_MODE=rva`, model: undefined,
   files: [{ path: 'request.md', text: '# request\n' }, { path: 'materials/photos/p1.jpg', base64: b64('\xff\xd8 not really a jpeg'), copies: ['out/photos/p1.jpg'] }, { path: 'materials/memo.txt', text: '메모' },
@@ -107,6 +109,7 @@ test('service: a review-automation-shaped draft job per harness: files in, read-
       assert.ok(seen.includes('state:running') && seen.at(-1) === 'end:done', seen.join(' '));
       assert.equal(r.result.code, 0);
       assert.equal(r.result.text, 'done (rva)');
+      assert.deepEqual(Object.keys(r.result), RESULT_020, 'a client without webSearch and events gets the 0.2.0 result');
       assert.ok(r.events > 0 && r.stage);
       const draft = JSON.parse(unb64(r.outputs['out/draft.json']));
       assert.deepEqual(draft.files, ['memo.txt', 'photos', 'photos/p1.jpg']);
@@ -217,6 +220,65 @@ test('main: configured from the environment, a 0666 socket, stale run folders re
   assert.equal(child.signalCode, 'SIGTERM', out);
 });
 
+test('service: a client allowed webSearch and events gets the CLI\'s events through the real runner, a search-enabled command, and capped events', BOX, async () => {
+  const w = await world({ limits: { eventBytes: 1000, eventsBytes: 1000 } });
+  try {
+    for (const id of ['claude-code', 'codex']) w.logIn('appc', 'u1', id);
+    const c = await w.c.events((await w.c.run({ user: 'u1', harness: 'claude-code', prompt: 'x', webSearch: true, events: true, outputs: ['seen.json'] })).id);
+    assert.equal(c.state, 'done');
+    // the fake's events as it printed them; the line cut in the middle is not JSON and is skipped
+    assert.deepEqual(c.result.events.map((e) => [e.type, e.subtype ?? e.result]), [['system', 'init'], ['result', 'first turn'], ['result', 'done (ok)']]);
+    assert.deepEqual(c.result.events[0], { type: 'system', subtype: 'init', session_id: 's1', model: 'claude-sonnet-5-5' });
+    assert.equal(c.result.eventsTruncated, false);
+    assert.equal(c.events, 3);
+    const args = JSON.parse(unb64(c.outputs['seen.json'])).args;
+    assert.ok(args.includes('--allowedTools') && args.filter((a) => a === 'WebSearch').length === 1 && args.includes('WebFetch'));
+    const x = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', webSearch: true, events: true, outputs: ['seen.json'] })).id);
+    assert.deepEqual(x.result.events.map((e) => e.type), ['thread.started', 'item.started', 'turn.completed']);
+    assert.ok(JSON.parse(unb64(x.outputs['seen.json'])).args.includes('web_search=live'));
+    // 64 events of 32 KiB each: every one over eventBytes, kept as { type, truncated } until eventsBytes is reached
+    const f = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'FAKE_MODE=flood', events: true })).id);
+    assert.equal(f.state, 'done');
+    assert.deepEqual(f.result.events[0], { type: 'text', truncated: true });
+    assert.equal(f.result.events.length, 30, '30 of 33 bytes each fit in 1000');
+    assert.equal(f.result.eventsTruncated, true);
+    assert.equal(f.events, 64);
+    // the same client without the fields: the 0.2.0 result
+    const plain = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x' })).id);
+    assert.deepEqual(Object.keys(plain.result), RESULT_020);
+  } finally { await w.close(); }
+});
+
+test('service: a box printing an event nested 4073, 5000 or 100000 deep: the run ends normally, the event is { type, truncated }, the service lives', BOX, async () => {
+  const w = await world();
+  try {
+    for (const id of ['claude-code', 'codex']) w.logIn('appc', 'u1', id);
+    for (const [harness, n] of [['codex', 4073], ['codex', 5000], ['codex', 100000], ['claude-code', 5000]]) {
+      const id = (await w.c.run({ user: 'u1', harness, prompt: `FAKE_MODE=deep-${n}`, events: true })).id;
+      const ended = await w.c.events(id), got = await w.c.getRun(id);
+      assert.deepEqual(ended, got, `${harness} ${n}`);
+      assert.equal(got.state, 'done');
+      assert.equal(got.result.text, `done (deep-${n})`);
+      assert.deepEqual(got.result.events[0], { type: 'deep', truncated: true });
+      assert.deepEqual(got.result.events.slice(1).map((e) => e.type), harness === 'codex' ? ['thread.started', 'item.started', 'turn.completed'] : ['system', 'result', 'result']);
+    }
+    assert.equal((await w.a.harnesses()).harnesses.length, 3, 'the service still answers');
+  } finally { await w.close(); }
+});
+
+test('main: a client entry whose webSearch or events is not true or false stops the service at start', BOX, () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-service-clients-'));
+  try {
+    writeFileSync(join(root, 'clients.json'), JSON.stringify({ clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a), events: 'yes' }] }));
+    const r = spawnSync(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { encoding: 'utf8', timeout: 30e3, env: {
+      PATH: process.env.PATH, HB_LISTEN: join(root, 'hb.sock'), HB_CLIENTS: join(root, 'clients.json'), HB_HOMES: join(root, 'homes'), HB_RUNS: join(root, 'runs'), HB_HARNESSES: 'codex',
+      HB_BIN_CODEX: FAKE.codex, HB_SOCAT: join(HERE, 'fake-socat') } });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /bad client entry appa: events must be true or false/);
+    assert.ok(!existsSync(join(root, 'hb.sock')), 'it never listened');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('main: a bad HB_MAX_OUTPUT_BYTES stops the service at start', async () => {
   for (const value of ['0', '-1', '1.5', '8MiB', '']) {
     const r = spawnSync(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { encoding: 'utf8', timeout: 30e3,
@@ -286,4 +348,397 @@ test('service: file copies count against the file-count limit', BOX, async () =>
     await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: 'a', text: 'x', copies: ['b'] }] }), { status: 400, code: 'bad_files' });
     assert.deepEqual(readdirSync(w.runs), []);
   } finally { await w.close(); }
+});
+
+// ---- webSearch and events over a stand-in runner: what the service checks, passes on and keeps, without a box
+const ROWS = [{ id: 'claude-code', name: 'Claude Code', version: '2.1.300', usable: true, why: null, webSearch: true },
+  { id: 'codex', name: 'Codex', version: '0.162.1', usable: true, why: null, webSearch: true }, { id: 'grok', name: 'Grok', version: '1.0.52', usable: true, why: null, webSearch: false }];
+const FAKE_RESULT = { code: 0, text: 'done', usage: { input: 1, output: 2 }, error: '', stderr: '', why: null, timedOut: false, canceled: false };
+async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = '', result = {} } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'hb-fake-svc-')), runs = join(root, 'runs'), sock = join(root, 'hb.sock'), calls = [];
+  mkdirSync(runs);
+  const hb = {
+    run: async (scoped, h, o) => {
+      calls.push({ scoped, h, ...o });
+      o.onStart();
+      for (const e of typeof events === 'function' ? events() : events) o.onEvent(e, { stage: '' });
+      if (output) writeFileSync(join(o.dir, 'out.txt'), output);
+      return { ...FAKE_RESULT, ...result };
+    },
+    exec: async () => ({ code: 0, out: '{}', why: null }),
+  };
+  const svc = createService({ hb, harnesses, runs, limits,
+    clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appc', tokenSha256: hex(TOKEN.c), webSearch: true, events: true }] });
+  await new Promise((r) => svc.server.listen(sock, r));
+  return { runs, sock, map: svc.runs, calls, a: harnessbox({ socketPath: sock, token: TOKEN.a }), c: harnessbox({ socketPath: sock, token: TOKEN.c }),
+    close: () => { svc.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+
+test('service: a client entry\'s webSearch and events must be true or false, else the service does not start', () => {
+  for (const k of ['webSearch', 'events']) {
+    for (const bad of ['true', 1, null, {}]) {
+      assert.throws(() => createService({ hb: {}, harnesses: ROWS, runs: tmpdir(), clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a), [k]: bad }] }),
+        new RegExp(`bad client entry appa: ${k} must be true or false`), `${k}: ${JSON.stringify(bad)}`);
+    }
+    for (const ok of [true, false]) assert.ok(createService({ hb: {}, harnesses: ROWS, runs: tmpdir(), clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a), [k]: ok }] }).server);
+  }
+});
+
+test('service: webSearch and events are refused unless the client\'s entry allows them, and webSearch where the harness has none', async () => {
+  const w = await fakeWorld();
+  try {
+    const run = { user: 'u1', harness: 'codex', prompt: 'x' };
+    await assert.rejects(w.a.run({ ...run, webSearch: true }), { status: 400, code: 'web_search_not_allowed' });
+    await assert.rejects(w.a.run({ ...run, events: true }), { status: 400, code: 'events_not_allowed' });
+    await assert.rejects(w.c.run({ ...run, harness: 'grok', webSearch: true }), { status: 400, code: 'web_search_unsupported', message: 'Grok does not support webSearch on this service' });
+    for (const k of ['webSearch', 'events']) for (const bad of ['true', 1, {}]) await assert.rejects(w.c.run({ ...run, [k]: bad }), { status: 400, code: 'bad_request' }, `${k}: ${JSON.stringify(bad)}`);
+    assert.equal(w.calls.length, 0, 'a refused run never reaches the runner');
+    assert.deepEqual(readdirSync(w.runs), [], 'and leaves no folder');
+    // false is allowed everywhere, as is a Grok run without webSearch at a client that may search
+    for (const [hb, body] of [[w.a, { ...run, webSearch: false, events: false }], [w.c, { ...run, harness: 'grok' }]]) assert.equal((await hb.events((await hb.run(body)).id)).state, 'done');
+  } finally { w.close(); }
+});
+
+test('service: without webSearch and events a run reaches the runner and comes back as before; with webSearch the runner is told', async () => {
+  const w = await fakeWorld({ events: [{ type: 'thread.started' }, { type: 'turn.completed', usage: { input_tokens: 1 } }] });
+  try {
+    for (const [hb, more] of [[w.a, {}], [w.a, { webSearch: false, events: false }], [w.c, {}], [w.c, { events: false }]]) {
+      const id = (await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', ...more })).id;
+      const ended = await hb.events(id), got = await hb.getRun(id);
+      assert.deepEqual(ended.result, FAKE_RESULT, JSON.stringify(more));
+      assert.deepEqual(got, ended);
+      assert.deepEqual(Object.keys(got.result), RESULT_020);
+      assert.equal(got.events, 2, 'the event count is still there');
+      assert.equal(w.calls.at(-1).webSearch, false);
+    }
+    await w.c.events((await w.c.run({ user: 'u1', harness: 'claude-code', prompt: 'x', webSearch: true })).id);
+    assert.equal(w.calls.at(-1).webSearch, true);
+  } finally { w.close(); }
+});
+
+test('service: events: true keeps the CLI\'s events in result.events, an oversized one as { type, truncated }, the first eventsBytes in total; GET and the end event agree', async () => {
+  const small = (i) => ({ type: 'item.completed', item: { type: 'web_search', id: `ws_${i}`, query: `q${i}`, url: `https://example.com/${i}` } });
+  const big = { type: 'item.completed', item: { type: 'command_execution', aggregated_output: 'x'.repeat(500) } }, untyped = { data: 'y'.repeat(500) };
+  const events = [small(0), big, untyped, ...Array.from({ length: 40 }, (_, i) => small(i + 1))];
+  const limits = { eventBytes: 300, eventsBytes: 1500 };
+  // the expected prefix: each kept event costs its JSON bytes plus one
+  const expect = [];
+  let bytes = 0;
+  for (const e of events) {
+    const item = Buffer.byteLength(JSON.stringify(e)) > limits.eventBytes ? { type: typeof e.type === 'string' ? e.type : null, truncated: true } : e;
+    if (bytes + Buffer.byteLength(JSON.stringify(item)) + 1 > limits.eventsBytes) break;
+    bytes += Buffer.byteLength(JSON.stringify(item)) + 1;
+    expect.push(item);
+  }
+  assert.ok(expect.length > 3 && expect.length < events.length, 'the limits cut the list');
+  const w = await fakeWorld({ events, limits });
+  try {
+    const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id;
+    const ended = await w.c.events(id), got = await w.c.getRun(id);
+    assert.deepEqual(ended, got, 'the end event and GET give the same run');
+    assert.deepEqual(got.result, { ...FAKE_RESULT, events: expect, eventsTruncated: true });
+    assert.deepEqual(got.result.events.slice(0, 3), [small(0), { type: 'item.completed', truncated: true }, { type: null, truncated: true }]);
+    assert.ok(JSON.stringify(got.result.events).length <= limits.eventsBytes + 1);
+    assert.equal(got.events, events.length, 'the count covers every event, kept or not');
+  } finally { w.close(); }
+  // under the caps: every event, eventsTruncated false
+  const few = await fakeWorld({ events: [small(1), small(2)] });
+  try {
+    const r = await few.c.events((await few.c.run({ user: 'u1', harness: 'claude-code', prompt: 'x', events: true })).id);
+    assert.deepEqual(r.result, { ...FAKE_RESULT, events: [small(1), small(2)], eventsTruncated: false });
+  } finally { few.close(); }
+});
+
+test('service: kept events count against the ended runs\' memory cap', async () => {
+  const events = Array.from({ length: 30 }, (_, i) => ({ type: 'text', data: `${i}`.padEnd(90, '.') })); // about 3000 bytes kept
+  const w = await fakeWorld({ events, limits: { keptBytes: 5000 } });
+  try {
+    const run = async (hb, more) => { const id = (await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', ...more })).id; await hb.events(id); return id; };
+    const plain = [await run(w.c, {}), await run(w.c, {})];
+    for (const id of plain) assert.equal((await w.c.getRun(id)).state, 'done', 'runs without events stay well under the cap');
+    const first = await run(w.c, { events: true }), second = await run(w.c, { events: true });
+    // the accounting follows the end (after the run folder is removed): wait for it
+    for (let i = 0; i < 50 && (await w.c.getRun(first).then(() => true, () => false)); i++) await sleep(20);
+    await assert.rejects(w.c.getRun(first), { status: 404, code: 'unknown_run' }, 'two runs of kept events pass 5000 bytes: the oldest ended runs go');
+    assert.equal((await w.c.getRun(second)).result.events.length, 30);
+  } finally { w.close(); }
+});
+
+test('service: GET /v1/harnesses says which harnesses support webSearch, the other fields as before', async () => {
+  const w = await fakeWorld();
+  try {
+    const list = (await w.a.harnesses()).harnesses;
+    assert.deepEqual(list.map((h) => Object.keys(h)), ROWS.map(() => ['id', 'name', 'version', 'usable', 'why', 'webSearch']));
+    assert.deepEqual(list.map((h) => [h.id, h.webSearch]), [['claude-code', true], ['codex', true], ['grok', false]]);
+  } finally { w.close(); }
+});
+
+const RVA_CLAUDE_ARGS = ['--tools', 'Read,Write,Edit,Agent,Bash', '--allowedTools', 'Read(//work/**)', 'Edit(//work/out/**)', 'Agent',
+  'Bash(python3 -I /work/skill/write-review/scripts/validate_draft.py *)', '--max-turns', '80'];
+test('service: args that name web search are refused for a client without webSearch; review-automation\'s args and a client allowed to search pass', async () => {
+  const w = await fakeWorld();
+  try {
+    for (const [harness, args] of [['codex', ['-c', 'web_search=live']], ['codex', ['-c', 'WEB_SEARCH="live"']], ['codex', ['-c', 'tools.web_search={}']],
+      ['codex', ['--enable', 'web_search_request']], ['claude-code', ['--allowedTools', 'WebSearch']], ['claude-code', ['--allowedTools', 'Read,WebSearch']],
+      ['claude-code', ['--tools', 'Read,websearch']], ['claude-code', ['--allowed-tools=WebSearch']], ['claude-code', ['--settings', '{"permissions":{"allow":["WebSearch"]}}']],
+      ['grok', ['--enable-web-search']], ['grok', ['--web search']]]) {
+      await assert.rejects(w.a.run({ user: 'u1', harness, prompt: 'x', args }), { status: 400, code: 'web_search_not_allowed' }, JSON.stringify(args));
+    }
+    assert.equal(w.calls.length, 0);
+    // review-automation's draft job (docs/service.md): its Claude Code options, none for Codex; a prompt is not checked
+    for (const [harness, args] of [['claude-code', RVA_CLAUDE_ARGS], ['codex', []], ['codex', undefined]]) {
+      const r = await w.a.events((await w.a.run({ user: 'u1', harness, prompt: 'Search the web for nothing; read /work/request.md.', ...(args ? { args } : {}) })).id);
+      assert.equal(r.state, 'done');
+      assert.deepEqual(w.calls.at(-1).args, args ?? []);
+    }
+    const r = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', args: ['-c', 'web_search=live'] })).id);
+    assert.equal(r.state, 'done', 'a client allowed webSearch keeps its options');
+    // spelled otherwise: \u escapes and a --settings file are refused to a client without webSearch, a --settings JSON is not
+    for (const [harness, args] of [['codex', ['-c', '"web_\\u0073earch"="live"']], ['codex', ['-c', 'tools.web_\\U00000073earch={}']],
+      ['claude-code', ['--allowedTools', 'Web\\u0053earch']], ['claude-code', ['--settings', '/work/settings.json']], ['claude-code', ['--settings=/work/settings.json']],
+      ['claude-code', ['--settings']]]) {
+      await assert.rejects(w.a.run({ user: 'u1', harness, prompt: 'x', args }), { status: 400, code: 'bad_args' }, JSON.stringify(args));
+    }
+    for (const args of [['--settings', '{"model":"sonnet"}'], ['--settings={"model":"sonnet"}']]) assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', args })).id)).state, 'done');
+  } finally { w.close(); }
+});
+
+test('service: the args check still refuses every spelling it refused, lets a backslash path through, and Codex gets web_search=disabled last', async () => {
+  const w = await fakeWorld();
+  try {
+    const refused = [
+      ['codex', ['-c', 'web_search=live'], 'web_search_not_allowed'], ['codex', ['--config=web_search=live'], 'web_search_not_allowed'],
+      ['codex', ['-cweb_search=live'], 'web_search_not_allowed'], ['codex', ['-c', ' WEB_SEARCH = "live" '], 'web_search_not_allowed'],
+      ['codex', ['-c', 'Web Search=live'], 'web_search_not_allowed'], ['codex', ['-c', '"web_\\u0073earch"="live"'], 'bad_args'],
+      ['codex', ['-c', 'tools.web_\\U00000073earch={}'], 'bad_args'], ['codex', ['-c', 'web_\\u0053EARCH=1'], 'bad_args'],
+      ['codex', ['-c', 'features={"web\\u005fsearch_request"=true}'], 'bad_args'], ['claude-code', ['--allowedTools', 'Web\\u0053earch'], 'bad_args'],
+      ['claude-code', ['--settings', '/work/s.json'], 'bad_args'], ['claude-code', ['--settings={s.json'], 'bad_args'],
+      // still refused, though they could not turn search on: the check reads no option's meaning (docs/service.md)
+      ['claude-code', ['--append-system-prompt', 'Never use web search.'], 'web_search_not_allowed'], ['claude-code', ['--disallowedTools', 'WebSearch'], 'web_search_not_allowed'],
+      ['claude-code', ['--append-system-prompt', 'See C:\\work\\u00e9t\\u00e9'], 'bad_args'],
+    ];
+    for (const [harness, args, code] of refused) await assert.rejects(w.a.run({ user: 'u1', harness, prompt: 'x', args }), { status: 400, code }, JSON.stringify(args));
+    assert.equal(w.calls.length, 0);
+    // a backslash that starts no \uXXXX escape (a Windows path) is no escape: 0.3.0 before this refused it
+    for (const args of [['--append-system-prompt', 'Paths look like C:\\Users\\me'], ['--append-system-prompt', 'C:\\Users\\u'], ['--add-dir', 'C:\\u12']]) {
+      assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', args })).id)).state, 'done', JSON.stringify(args));
+      assert.deepEqual(w.calls.at(-1).args, args);
+    }
+    // whatever the args, a Codex run without webSearch ends -c web_search=disabled -: also for a client allowed webSearch, whose args are not checked
+    for (const [hb, args] of [[w.a, ['-c', 'model_reasoning_effort="low"']], [w.c, ['-c', 'web_search=live']], [w.c, ['--config=web_search=live', '-c', '"web_\\u0073earch"="live"']]]) {
+      assert.equal((await hb.events((await hb.run({ user: 'u1', harness: 'codex', prompt: 'x', args })).id)).state, 'done');
+      const { args: extra, webSearch } = w.calls.at(-1);
+      assert.deepEqual([extra, webSearch], [args, false]);
+      assert.deepEqual(codex.job.command({ prompt: 'x', dir: BOX_DIR, has: new Set(), extra, webSearch }).args.slice(-3), ['-c', 'web_search=disabled', '-'], JSON.stringify(args));
+    }
+  } finally { w.close(); }
+});
+
+test('service: a --settings value is inline only when, trimmed, it parses as a JSON object; anything Claude Code would open as a file is refused', async () => {
+  const w = await fakeWorld();
+  try {
+    // Claude Code 2.1.300 opens {s.json as a file (it does not end with }); [1], null and "x" are not objects (trimmed, none is {…})
+    for (const v of ['{s.json', '{"model":"sonnet"', '{"model":"sonnet"}x', '[1]', '["{}"]', 'null', '"{}"', '', ' ', 'settings.json', '{}.json']) {
+      for (const args of [['--settings', v], [`--settings=${v}`], ['--model', 'm', '--settings', v]]) {
+        await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', args }), { status: 400, code: 'bad_args' }, JSON.stringify(args));
+      }
+    }
+    assert.equal(w.calls.length, 0);
+    // inline JSON with whitespace around it, which Claude Code trims, is no file
+    for (const v of [' {"model":"sonnet"}', '{"model":"sonnet"} ', '\n\t{ "model": "sonnet" }\n', '{}']) {
+      for (const args of [['--settings', v], [`--settings=${v}`]]) {
+        assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', args })).id)).state, 'done', JSON.stringify(args));
+        assert.deepEqual(w.calls.at(-1).args, args);
+      }
+    }
+    assert.equal((await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', args: ['-c', '"web_\\u0073earch"="live"'] })).id)).state, 'done', 'a client allowed webSearch is not checked');
+  } finally { w.close(); }
+});
+
+// {"type":"deep","a":{"a":…1…}} nested n objects under the top one: n + 1 deep, parsed the way the runner parses a line
+const deepEvent = (n) => JSON.parse(`{"type":"deep","a":${'{"a":'.repeat(n)}1${'}'.repeat(n)}}`);
+test('service: an event nested past the stack or past eventDepth is kept as { type, truncated }, and the end, GET and the service go on', async () => {
+  const w = await fakeWorld({ events: () => [{ type: 'a' }, deepEvent(4073), deepEvent(5000), deepEvent(100000), deepEvent(63), deepEvent(64), { type: 'z' }] });
+  try {
+    const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id;
+    const ended = await w.c.events(id), got = await w.c.getRun(id);
+    assert.deepEqual(ended, got);
+    const cut = { type: 'deep', truncated: true };
+    assert.deepEqual(got.result.events, [{ type: 'a' }, cut, cut, cut, deepEvent(63), cut, { type: 'z' }], '64 deep is kept, 65 is not');
+    assert.equal(got.result.eventsTruncated, false);
+    assert.equal(got.events, 7);
+    assert.equal((await w.c.harnesses()).harnesses.length, 3, 'the service still answers');
+  } finally { w.close(); }
+});
+
+test('service: eventsCount keeps exactly that many events; one more marks eventsTruncated; many small objects', async () => {
+  for (const [n, kept, truncated] of [[5, 5, false], [6, 5, true]]) {
+    const w = await fakeWorld({ events: Array.from({ length: n }, (_, i) => ({ type: 't', i })), limits: { eventsCount: 5 } });
+    try {
+      const r = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id);
+      assert.deepEqual([r.result.events.length, r.result.eventsTruncated, r.events], [kept, truncated, n], `${n} events`);
+      assert.deepEqual(r.result.events.at(-1), { type: 't', i: kept - 1 });
+    } finally { w.close(); }
+  }
+  for (const [n, truncated] of [[2000, false], [2001, true], [50000, true]]) {
+    const w = await fakeWorld({ events: () => Array.from({ length: n }, () => ({})) });
+    try {
+      const r = await w.c.getRun((await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id)).id);
+      assert.deepEqual([r.result.events.length, r.result.eventsTruncated], [2000, truncated], `${n} small events: the default 2000`);
+    } finally { w.close(); }
+  }
+});
+
+// streamer-manager's options (its harnessbox runs): none names web search, carries a \u escape or a --settings file
+const SM_CODEX_ARGS = ['-c', 'features.shell_tool=false', '-c', 'features.unified_exec=false', '-c', 'features.apply_patch_freeform=false', '-c', 'forced_login_method="chatgpt"',
+  '--image=/work/image.jpg', '-c', 'model_reasoning_effort="medium"'];
+const SM_CLAUDE_ARGS = ['--tools', 'Read', '--allowedTools', 'Read(//work/**)', '--setting-sources', '', '--disable-slash-commands', '--no-chrome', '--prompt-suggestions', 'false',
+  '--permission-prompts', 'none', '--effort', 'low', '--max-turns', '8'];
+test('service: review-automation\'s and streamer-manager\'s options pass the args checks unchanged', async () => {
+  const w = await fakeWorld();
+  try {
+    for (const [harness, args] of [['claude-code', RVA_CLAUDE_ARGS], ['claude-code', SM_CLAUDE_ARGS], ['codex', SM_CODEX_ARGS]]) {
+      for (const hb of [w.a, w.c]) {
+        const r = await hb.events((await hb.run({ user: 'u1', harness, prompt: 'x', args })).id);
+        assert.equal(r.state, 'done', `${harness} ${JSON.stringify(args)}`);
+        assert.deepEqual(w.calls.at(-1).args, args);
+      }
+    }
+  } finally { w.close(); }
+});
+
+test('service: a forgotten run lets go of its events, outputs and result, whether the memory cap, the run cap or keepMs forgets it', async () => {
+  const events = Array.from({ length: 30 }, (_, i) => ({ type: 'text', data: `${i}`.padEnd(90, '.') }));
+  // outputs are read through /proc (readOutBytes): on Linux out.txt comes back, elsewhere it is null; either way it is dropped
+  const linux = process.platform === 'linux';
+  let w = await fakeWorld({ events, limits: { keptBytes: 8000 }, output: 'o'.repeat(3000) });
+  try {
+    const run = async () => { const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true, outputs: ['out.txt'] })).id; await w.c.events(id); return id; };
+    const first = await run(), a = w.map.get(first);
+    for (let i = 0; i < 50 && !a.timer; i++) await sleep(20); // the end's bookkeeping follows the end event
+    assert.ok(a.kept && a.result && 'out.txt' in a.outputs && a.timer, 'an ended run holds its fields until it is forgotten');
+    if (linux) assert.equal(Buffer.from(a.outputs['out.txt'], 'base64').length, 3000);
+    const second = await run(), b = w.map.get(second);
+    for (let i = 0; i < 50 && w.map.has(first); i++) await sleep(20);
+    assert.ok(!w.map.has(first), 'two runs of 4410 bytes of events (and 3000 of output on Linux) pass 8000: the first goes');
+    assert.deepEqual([a.kept, a.result, a.outputs, a.validator, a.timer, a.bytes], [null, null, null, null, null, 0], 'and holds nothing large any more');
+    for (let i = 0; i < 50 && !b.timer; i++) await sleep(20);
+    assert.ok(b.kept && b.result && 'out.txt' in b.outputs && b.timer, 'the run that stays keeps everything');
+    if (linux) assert.equal(Buffer.from(b.outputs['out.txt'], 'base64').length, 3000);
+    assert.equal((await w.c.getRun(second)).result.events.length, 30);
+  } finally { w.close(); }
+  w = await fakeWorld({ events, limits: { keptRuns: 1 }, output: 'o' });
+  try {
+    const first = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true, outputs: ['out.txt'] })).id;
+    await w.c.events(first);
+    const a = w.map.get(first);
+    for (let i = 0; i < 50 && !a.timer; i++) await sleep(20);
+    await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x' })).id);
+    assert.deepEqual([w.map.has(first), a.kept, a.outputs, a.timer], [false, null, null, null], 'the run cap forgets the oldest ended run the same way');
+  } finally { w.close(); }
+  w = await fakeWorld({ events, limits: { keepMs: 100 } });
+  try {
+    const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id;
+    await w.c.events(id);
+    const a = w.map.get(id);
+    for (let i = 0; i < 50 && w.map.has(id); i++) await sleep(20);
+    assert.deepEqual([w.map.has(id), a.kept, a.result], [false, null, null], 'keepMs forgets it the same way');
+    await assert.rejects(w.c.getRun(id), { status: 404 });
+  } finally { w.close(); }
+});
+
+test('service: after the memory cap forgets runs, the heap holds about what is accounted, not every run ever kept', () => {
+  // review 2's measurement: 40 runs of wide events (each about 2 MiB in memory), keptBytes 20 MiB, in a process with gc exposed
+  const script = `
+    import { mkdtempSync, mkdirSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path'; import { createHash } from 'node:crypto';
+    import { createService } from ${JSON.stringify(join(HERE, '..', 'src', 'server.mjs'))}; import { harnessbox } from ${JSON.stringify(join(HERE, '..', 'src', 'client.mjs'))};
+    const root = mkdtempSync(join(tmpdir(), 'hb-heap-')), runs = join(root, 'runs'), sock = join(root, 's'); mkdirSync(runs);
+    const line = JSON.stringify({ type: 'w', s: '一' + 'a'.repeat(60000) });
+    const hb = { run: async (s, h, o) => { o.onStart(); for (let i = 0; i < 40; i++) o.onEvent(JSON.parse(line), { stage: '' }); return { code: 0, text: '', usage: { input: 0, output: 0 }, error: '', stderr: '', why: null, timedOut: false, canceled: false }; } };
+    const token = 'token-of-client-c-0123456789';
+    const svc = createService({ hb, harnesses: [{ id: 'codex', name: 'Codex', usable: true }], runs, limits: { keptBytes: 20 * 2 ** 20 },
+      clients: [{ id: 'appc', tokenSha256: createHash('sha256').update(token).digest('hex'), events: true }] });
+    await new Promise((r) => svc.server.listen(sock, r));
+    const c = harnessbox({ socketPath: sock, token }), settle = async () => { for (let k = 0; k < 3; k++) { globalThis.gc(); await new Promise((r) => setTimeout(r, 100)); } };
+    await settle();
+    const h0 = process.memoryUsage().heapUsed;
+    for (let i = 0; i < 40; i++) await c.events((await c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id);
+    await new Promise((r) => setTimeout(r, 300)); await settle();
+    let accounted = 0; for (const r of svc.runs.values()) accounted += r.bytes ?? 0;
+    console.log(JSON.stringify({ kept: svc.runs.size, accounted, heap: process.memoryUsage().heapUsed - h0 }));
+    svc.close(); process.exit(0);`;
+  const r = spawnSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', script], { encoding: 'utf8', timeout: 120e3 });
+  assert.equal(r.status, 0, r.stderr);
+  const m = JSON.parse(r.stdout.trim().split('\n').at(-1));
+  assert.ok(m.kept < 40 && m.accounted <= 20 * 2 ** 20, JSON.stringify(m));
+  assert.ok(m.heap < m.accounted * 1.5, `heap grew ${(m.heap / 2 ** 20).toFixed(1)} MiB for ${(m.accounted / 2 ** 20).toFixed(1)} MiB accounted`);
+});
+
+test('service: U+2028 and U+2029 in an event and in result.text come back unchanged through events() and getRun, never raw on the wire', async () => {
+  const title = 'line\u2028separator and paragraph\u2029separator', text = 'last\u2028message\u2029';
+  const event = { type: 'item.completed', item: { type: 'web_search', title } };
+  for (const events of [[event], []]) {
+    const w = await fakeWorld({ events, result: { text } });
+    try {
+      const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: events.length > 0 })).id;
+      const seen = [];
+      const ended = await w.c.events(id, (e, run) => seen.push(`${e}:${run.state}`)), got = await w.c.getRun(id);
+      assert.deepEqual(ended, got);
+      assert.equal(seen.at(-1), 'end:done');
+      assert.equal(got.result.text, text);
+      if (events.length) assert.deepEqual(got.result.events, [event]);
+      // what a client copied from 0.3.0 reads (a regex whose $ also ends a line at U+2028): the server writes them escaped
+      const wire = await new Promise((done) => {
+        http.get({ socketPath: w.sock, path: `/v1/runs/${id}/events`, headers: { authorization: `Bearer ${TOKEN.c}` } }, (res) => {
+          let t = ''; res.setEncoding('utf8'); res.on('data', (d) => { t += d; }); res.on('end', () => done(t));
+        });
+      });
+      assert.doesNotMatch(wire, /[\u2028\u2029]/);
+      assert.match(wire, /\\u2028/);
+      assert.deepEqual(JSON.parse(/^data: (.+)$/m.exec(wire)[1]), got, 'the old client\'s parse gives the same run');
+    } finally { w.close(); }
+  }
+});
+
+test('client: a data line holding raw U+2028 and U+2029 (as a 0.3.0 server sent them) is one line', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-client-sse-')), sock = join(root, 'fake.sock');
+  const run = { id: 'run_x', state: 'done', result: { text: 'a\u2028b\u2029c' } };
+  const fake = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`event: end\ndata: ${JSON.stringify(run)}\n\n`);
+  });
+  await new Promise((r) => fake.listen(sock, r));
+  try {
+    assert.match(JSON.stringify(run), /\u2028/, 'JSON.stringify leaves it raw');
+    assert.deepEqual(await harnessbox({ socketPath: sock, token: TOKEN.a }).events('run_x'), run);
+  } finally {
+    fake.closeAllConnections();
+    fake.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('service: result.events holds objects only: an array, null or scalar handed to onEvent is not kept', async () => {
+  const w = await fakeWorld({ events: [[1], { type: 'a' }, null, [{ type: 'x' }], 7, 'text', { type: 'z', n: 1.0 }] });
+  try {
+    const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id;
+    const ended = await w.c.events(id), got = await w.c.getRun(id);
+    assert.deepEqual(ended, got);
+    assert.equal(got.state, 'done');
+    assert.deepEqual(got.result.events, [{ type: 'a' }, { type: 'z', n: 1 }]);
+    assert.equal(got.result.eventsTruncated, false);
+  } finally { w.close(); }
+});
+
+test('service: event and item types that are Object.prototype keys or end in half a surrogate pair stay plain strings', async () => {
+  const pad = 'x'.repeat(70000);
+  const w = await fakeWorld({ events: [{ type: `${'T'.repeat(99)}\u{1F600}`, pad }, { type: 'T'.repeat(200), pad }, { type: `${'S'.repeat(39)}\u{1F600}` }],
+    harnesses: [...ROWS, { id: 'toString', name: 'Odd', version: '1.0.0', usable: true, why: null, webSearch: false }] });
+  try {
+    const r = await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id);
+    assert.deepEqual(r.result.events.slice(0, 2), [{ type: 'T'.repeat(99), truncated: true }, { type: 'T'.repeat(100), truncated: true }], 'never half a pair');
+    assert.equal(r.stage, 'S'.repeat(39));
+    // a harness id that is an Object.prototype key, with no models configured: any well-formed model, not a 500
+    assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'toString', prompt: 'x', model: 'm1' })).id)).state, 'done');
+  } finally { w.close(); }
 });

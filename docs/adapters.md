@@ -59,6 +59,9 @@ Rules the runner relies on:
   whether the CLI's input count includes cache tokens.
 - Anything the job writes and the runner reads (a last-message file, say) goes through `readOut(dir, name)` in `job.finish`, never
   `readFile`: the box could have replaced it with a link to another user's credentials.
+- `webSearch: true` on the adapter says `job.command` honours `webSearch` (it is `false` unless the caller asked): turn on only the
+  CLI's own server-side search, by replacing the value that turns it off, and never add a host for it. Without the property the
+  runner refuses a run with `webSearch`.
 - Keep the prompt off the command line if the CLI can read it from stdin or a file; the runner refuses prompts starting with `-` when
   they are an argument.
 
