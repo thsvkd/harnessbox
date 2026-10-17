@@ -91,8 +91,9 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
   literally (`web search`, `web_search`, `web-search` or `websearch`, any case; Codex's `-c web_search=live`, which would win over
   the adapter's because the caller's options come last, `-c tools.web_search=…`, `--enable web_search_request`, Claude Code's
   `--allowedTools WebSearch` or `--tools …,WebSearch`, a `--settings` JSON naming it) is a 400 `web_search_not_allowed`, even one
-  that would only deny it; an element with a `\u`/`\U` escape, and `--settings` followed by anything but inline JSON (a file path),
-  are a 400 `bad_args`. Past this check, Claude Code still has the adapter's `--disallowedTools WebSearch`, and a deny beats any
+  that would only deny it; an element with a `\u`/`\U` escape, and a `--settings` value (`--settings v` or `--settings=v`) that,
+  trimmed, does not parse as a JSON object (Claude Code opens it as a file unless it starts with `{` and ends with `}`), are a
+  400 `bad_args`. Past this check, Claude Code still has the adapter's `--disallowedTools WebSearch`, and a deny beats any
   allow. Codex has only the adapter's explicit `web_search=disabled`, and a later `-c` for the same key wins over it: a spelling
   this check misses (another escape or quoting of the TOML key, a config key or alias that sets search without spelling it, a
   settings file reached another way) can turn search on. Nor are the other options that widen what the CLI lets the model do checked

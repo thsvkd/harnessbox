@@ -18,8 +18,8 @@
   (an active run's once it ends). Runs without the fields are unchanged.
 - Service: a client without `webSearch` may not spell web search in `args` (400 `web_search_not_allowed`): Codex's later
   `-c web_search=live` overrode the adapter's `web_search=disabled`, in 0.2.0 too. For such a client an element with a `\u`
-  escape or a `--settings` file path is a 400 `bad_args`. A check by spelling, not a boundary; other options in `args` still widen
-  the CLI.
+  escape or a `--settings` value that is not inline JSON (trimmed, a JSON object; anything else Claude Code may open as a file) is
+  a 400 `bad_args`. A check by spelling, not a boundary; other options in `args` still widen the CLI.
 - Runner: a stdout line that parses as a JSON array is no event, like a scalar or `null` before it: `onEvent` and the adapter's
   `event` no longer see it (it reached `result.events` as an array).
 - Service: a forgotten ended run (memory cap, run cap, keepMs) clears its expiry timer and drops its events, outputs and result,

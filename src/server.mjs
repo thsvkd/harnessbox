@@ -33,6 +33,10 @@ const strings = (v, max, what) => {
   return v;
 };
 
+// Claude Code reads a --settings value as inline JSON when, trimmed, it starts with { and ends with }, else as a file path (2.1.300).
+// Inline here: a value whose trim parses as a JSON object, which Claude always reads inline; anything else counts as a file.
+const jsonObject = (v) => { try { const j = JSON.parse(v.trim()); return j !== null && typeof j === 'object' && !Array.isArray(j); } catch { return false; } };
+
 /**
  * @param {object} o
  * @param {ReturnType<typeof createRunner> extends Promise<infer R> ? R : never} o.hb  the runner (createRunner), already detected
@@ -160,7 +164,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     // --tools): an option that names web search is refused. Other options that widen the CLI are not checked (docs/service.md).
     if (!c.webSearch && args.some((a) => /web[\s_-]?search/i.test(a))) no(400, 'web_search_not_allowed', 'args may not name web search for this client');
     // a check by spelling only: \u escapes (TOML, JSON) and a --settings file could spell it otherwise, so those are refused too
-    if (!c.webSearch && args.some((a, i) => /\\u/i.test(a) || (a === '--settings' && !args[i + 1]?.startsWith('{')) || (a.startsWith('--settings=') && !a.slice(11).startsWith('{')))) {
+    if (!c.webSearch && args.some((a, i) => /\\u/i.test(a) || (a === '--settings' && !jsonObject(args[i + 1])) || (a.startsWith('--settings=') && !jsonObject(a.slice(11))))) {
       no(400, 'bad_args', 'args may not carry \\u escapes or a --settings file for this client');
     }
     if (![...outputs, ...readonly].every(safePath) || new Set(outputs).size !== outputs.length) no(400, 'bad_path', 'outputs and readonly are distinct relative paths');

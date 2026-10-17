@@ -500,6 +500,26 @@ test('service: args that name web search are refused for a client without webSea
       await assert.rejects(w.a.run({ user: 'u1', harness, prompt: 'x', args }), { status: 400, code: 'bad_args' }, JSON.stringify(args));
     }
     for (const args of [['--settings', '{"model":"sonnet"}'], ['--settings={"model":"sonnet"}']]) assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', args })).id)).state, 'done');
+  } finally { w.close(); }
+});
+
+test('service: a --settings value is inline only when, trimmed, it parses as a JSON object; anything Claude Code would open as a file is refused', async () => {
+  const w = await fakeWorld();
+  try {
+    // Claude Code 2.1.300 opens {s.json as a file (it does not end with }); [1], null and "x" are not objects (trimmed, none is {…})
+    for (const v of ['{s.json', '{"model":"sonnet"', '{"model":"sonnet"}x', '[1]', '["{}"]', 'null', '"{}"', '', ' ', 'settings.json', '{}.json']) {
+      for (const args of [['--settings', v], [`--settings=${v}`], ['--model', 'm', '--settings', v]]) {
+        await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', args }), { status: 400, code: 'bad_args' }, JSON.stringify(args));
+      }
+    }
+    assert.equal(w.calls.length, 0);
+    // inline JSON with whitespace around it, which Claude Code trims, is no file
+    for (const v of [' {"model":"sonnet"}', '{"model":"sonnet"} ', '\n\t{ "model": "sonnet" }\n', '{}']) {
+      for (const args of [['--settings', v], [`--settings=${v}`]]) {
+        assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', args })).id)).state, 'done', JSON.stringify(args));
+        assert.deepEqual(w.calls.at(-1).args, args);
+      }
+    }
     assert.equal((await w.c.events((await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', args: ['-c', '"web_\\u0073earch"="live"'] })).id)).state, 'done', 'a client allowed webSearch is not checked');
   } finally { w.close(); }
 });
