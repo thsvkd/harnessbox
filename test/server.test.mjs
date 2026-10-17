@@ -667,6 +667,18 @@ test('client: a data line holding raw U+2028 and U+2029 (as a 0.3.0 server sent 
   }
 });
 
+test('service: result.events holds objects only: an array, null or scalar handed to onEvent is not kept', async () => {
+  const w = await fakeWorld({ events: [[1], { type: 'a' }, null, [{ type: 'x' }], 7, 'text', { type: 'z', n: 1.0 }] });
+  try {
+    const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true })).id;
+    const ended = await w.c.events(id), got = await w.c.getRun(id);
+    assert.deepEqual(ended, got);
+    assert.equal(got.state, 'done');
+    assert.deepEqual(got.result.events, [{ type: 'a' }, { type: 'z', n: 1 }]);
+    assert.equal(got.result.eventsTruncated, false);
+  } finally { w.close(); }
+});
+
 test('service: event and item types that are Object.prototype keys or end in half a surrogate pair stay plain strings', async () => {
   const pad = 'x'.repeat(70000);
   const w = await fakeWorld({ events: [{ type: `${'T'.repeat(99)}\u{1F600}`, pad }, { type: 'T'.repeat(200), pad }, { type: `${'S'.repeat(39)}\u{1F600}` }],

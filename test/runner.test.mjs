@@ -389,6 +389,13 @@ test('run: each harness\'s hardened command in the user\'s own box, cleared envi
       r = await w.hb.run('alice', id, { prompt: 'FAKE_MODE=junk', dir: w.job(), onEvent: () => { throw new Error('a caller bug'); } });
       assert.deepEqual([r.code, r.text, r.usage], [0, 'done (junk)', expect[id]], id);
     }
+    // onEvent sees objects only: the null, "text", [1] and 7 lines are not events
+    for (const id of IDS) {
+      const seen = [];
+      await w.hb.run('alice', id, { prompt: 'FAKE_MODE=junk', dir: w.job(), onEvent: (e) => { seen.push(e); } });
+      assert.ok(seen.length > 1 && seen.every((e) => e && typeof e === 'object' && !Array.isArray(e)), `${id}: ${JSON.stringify(seen)}`);
+      assert.ok(seen.some((e) => e.result === 'junk'), id);
+    }
     const ac = new AbortController();
     ac.abort();
     r = await w.hb.run('alice', 'codex', { prompt: 'x', dir: w.job(), signal: ac.signal });

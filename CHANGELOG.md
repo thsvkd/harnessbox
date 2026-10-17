@@ -10,15 +10,18 @@
 - Service: a client entry may set `"webSearch": true` and `"events": true` (default false; another value stops the service at
   start). `POST /v1/runs` takes `webSearch` and `events`; asking for one the client is not allowed is a 400
   (`web_search_not_allowed`, `events_not_allowed`; `web_search_unsupported` for Grok). `events: true` puts the CLI's JSON events
-  in `result.events` (2000 events and 1 MiB per run, 64 KiB and 64 levels of nesting per event, `eventsTruncated`). They are kept
-  as the JSON text measured on arrival and written into answers as such; an event that does not serialize or is too deep becomes
-  `{ type, truncated: true }`, and a run's answer, SSE events included, falls back to the run without its events rather than
-  throwing. Ended runs' kept events count against the 256 MiB at their in-memory size (an active run's once it ends). Runs
-  without the fields are unchanged.
+  in `result.events` (2000 events and 1 MiB per run, 64 KiB and 64 levels of nesting per event, `eventsTruncated`): each stdout
+  line that parsed as a JSON object, serialized again from the parsed object (not the bytes printed: numbers normalized, a
+  repeated key's last value). They are kept as the JSON text measured on arrival and written into answers as such; an event
+  that does not serialize or is too deep becomes `{ type, truncated: true }`, and a run's answer, SSE events included, falls back
+  to the run without its events rather than throwing. Ended runs' kept events count against the 256 MiB at their in-memory size
+  (an active run's once it ends). Runs without the fields are unchanged.
 - Service: a client without `webSearch` may not spell web search in `args` (400 `web_search_not_allowed`): Codex's later
   `-c web_search=live` overrode the adapter's `web_search=disabled`, in 0.2.0 too. For such a client an element with a `\u`
   escape or a `--settings` file path is a 400 `bad_args`. A check by spelling, not a boundary; other options in `args` still widen
   the CLI.
+- Runner: a stdout line that parses as a JSON array is no event, like a scalar or `null` before it: `onEvent` and the adapter's
+  `event` no longer see it (it reached `result.events` as an array).
 - Service: a forgotten ended run (memory cap, run cap, keepMs) clears its expiry timer and drops its events, outputs and result,
   so the 30-minute timer no longer keeps every forgotten run in memory.
 - Adapters: Codex's stage reads its item-type table by own keys only (`constructor`, `__proto__` and the like are plain stages);

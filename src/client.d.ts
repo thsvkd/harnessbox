@@ -20,8 +20,9 @@ export interface Run {
   createdAt: string; startedAt: string | null; endedAt: string | null; stage: string; events: number; error?: string;
   result: {
     code: number; text: string; usage: { input: number; output: number; unknown?: true }; error: string; stderr: string; why: string | null; timedOut: boolean; canceled: boolean; loggedIn?: boolean;
-    /** With events: true: the CLI's stdout events as it printed them (fields from the box: validate before use), the first 2000 and
-     *  1 MiB; an event over 64 KiB or nested deeper than 64 levels is { type, truncated: true }. */
+    /** With events: true: the CLI's stdout lines that parsed as JSON objects, each serialized again from the parsed object (numbers
+     *  normalized, a repeated key's last value; fields from the box: validate before use), the first 2000 and 1 MiB; an event over
+     *  64 KiB or nested deeper than 64 levels is { type, truncated: true }. */
     events?: Record<string, any>[];
     /** With events: true: events past the 2000 or the 1 MiB were dropped. */
     eventsTruncated?: boolean;

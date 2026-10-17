@@ -403,11 +403,11 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
         b.kill();
         return false;
       };
-      // one JSON event a line; a line that does not parse (cut off by a stop, say) is skipped
+      // one JSON event a line, an object; a line that does not parse (cut off by a stop, say) or is an array or a scalar is skipped
       const line = (l) => {
         let e;
         try { e = JSON.parse(l); } catch { return; }
-        if (!e || typeof e !== 'object') return;
+        if (!e || typeof e !== 'object' || Array.isArray(e)) return;
         try { a.job.event(e, acc); } catch { /* hostile events cannot end the runner */ }
         try { Promise.resolve(onEvent?.(e, { stage: acc.stage })).catch(() => report('onEvent handler failed')); } catch { report('onEvent handler failed'); }
       };

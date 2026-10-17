@@ -231,7 +231,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     return max;
   };
   const keep = (k, e) => {
-    if (k.truncated) return;
+    if (k.truncated || !e || typeof e !== 'object' || Array.isArray(e)) return; // objects only, as the runner passes them
     let t = null;
     try { t = JSON.stringify(e); } catch { /* too deep for this stack */ }
     if (typeof t !== 'string' || Buffer.byteLength(t) > L.eventBytes || depth(t) > L.eventDepth) t = JSON.stringify({ type: typeof e.type === 'string' ? clip(e.type, 100) : null, truncated: true });
@@ -251,7 +251,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
         onEvent: (e, { stage }) => {
           r.events++;
           if (r.kept) keep(r.kept, e);
-          r.stage = stage || (typeof e.type === 'string' ? clip(e.type, 40) : '');
+          r.stage = stage || (typeof e?.type === 'string' ? clip(e.type, 40) : '');
           if (Date.now() - last >= 1000) { last = Date.now(); emit(r, 'progress'); }
         },
       });

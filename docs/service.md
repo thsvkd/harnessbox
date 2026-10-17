@@ -99,12 +99,14 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
   (another `-c` key, `--settings` hooks or permissions, `--add-dir`, more tools), as before. Give such clients' args only from
   your own code.
 - `events: true` (only for a client whose entry has `"events": true`, else 400 `events_not_allowed`): the run's
-  `result.events` holds the CLI's stdout events, each line that parsed as a JSON object, as printed (Claude Code's stream-json,
-  Codex's `--json`, Grok's streaming-json), in order: the first 2000 and the first 1 MiB of them (as JSON, a comma each; past
-  either, `result.eventsTruncated: true`). An event over 64 KiB, nested deeper than 64 levels, or too deep to serialize at all is
-  replaced by `{ type, truncated: true }`, so that parsing and serializing `result.events` again cannot exhaust a stack. The service
-  keeps each event as the JSON text it measured and writes that text into the answer, never serializing a box's object again.
-  Their fields come from the box: validate before use.
+  `result.events` holds the CLI's stdout events (Claude Code's stream-json, Codex's `--json`, Grok's streaming-json), in order:
+  each line that parsed as a JSON object (a line that is an array, a string, a number or `null` is no event and is skipped), the
+  first 2000 and the first 1 MiB of them (as JSON, a comma each; past either, `result.eventsTruncated: true`). They are not the
+  bytes the CLI printed but the parsed object serialized again: whitespace goes, numbers are normalized (`1.0` is `1`, `1e2` is
+  `100`, digits past a double's precision are lost), and of a key given twice only the last value stays. An event over 64 KiB,
+  nested deeper than 64 levels, or too deep to serialize at all is replaced by `{ type, truncated: true }`, so that parsing and
+  serializing `result.events` again cannot exhaust a stack. The service serializes each event once, on arrival, keeps that JSON
+  text (the size it measured) and writes it into the answer as it is. Their fields come from the box: validate before use.
 - `webSearch` and `events` false or absent: the run and its result are exactly as without them (no `events` in `result`).
 
 `GET /v1/runs/:id` → the run:

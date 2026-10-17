@@ -26,7 +26,8 @@ import { join } from 'node:path';
  * @property {{command(o: {prompt: string, dir: string, has: Set<string>, extra: string[], webSearch: boolean}): {args: string[], stdin?: string},
  *   event(e: any, acc: {text: string, usage: {input: number, output: number}, reports: number, error: string, stage: string}): void,
  *   finish?(acc: object, o: {dir: string, readOut: Function}): Promise<void>}} job
- *   event sees each JSON line of stdout; reports counts usage reports (none: the usage is marked unknown)
+ *   event sees each line of stdout that parses as a JSON object (not an array or a scalar); reports counts usage reports (none: the
+ *   usage is marked unknown)
  */
 
 const URL_RE = /https:\/\/[^\s"'<>`]+/;
