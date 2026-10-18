@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0
+
+- Client versions (docs/service.md "Client versions"): every answer has `harnessbox-version`; the client sends
+  `harnessbox-client: <VERSION>` (`VERSION`, `older` exported) and the service logs each client's version once. A client older than
+  `MIN_CLIENT` (0.2.0) gets 426 `client_too_old`; `GET /v1/client` hands out `src/client.mjs` with its Ed25519 signature
+  (`src/client.mjs.sig`, `npm run sign-client`). On a 426 the client loads that one in memory when the maintainers' key in its copy
+  signed it (the version read from the signed text before any of it runs) and it is no older than its copy, the newest one the
+  process loaded or the minimum, and asks again once (`autoUpdate`, default true; else 426 `client_update_failed`). Every client
+  object of the process then uses it. `HarnessboxError` is recognized across copies (`instanceof` holds after an update).
+- Tests: `test/compat` holds each released client (0.2.0 to 0.5.0); every one from `MIN_CLIENT` on runs a login, a draft job with
+  events and outputs, error codes, logout and purge against the service. `src/client.mjs` must be the copy of its `VERSION`, signed.
+
 ## 0.4.0
 
 - Proxy: a tunnel carries only TLS whose ClientHello names the CONNECT host (`server_name`, one record, no ECH); anything else is

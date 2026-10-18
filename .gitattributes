@@ -1,0 +1,4 @@
+# signed bytes (npm run sign-client): no line-ending conversion
+src/client.mjs -text
+src/client.mjs.sig -text
+test/compat/*.mjs -text

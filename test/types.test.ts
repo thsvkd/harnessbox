@@ -1,6 +1,6 @@
 // Compile the public consumer API. This file is never executed and never starts a real CLI.
 import { Busy, claudeCode, codex, createRunner, diskUse, grok, readOut, type Adapter, type RunResult } from 'harnessbox';
-import { harnessbox, HarnessboxError, type Run } from 'harnessbox/client';
+import { harnessbox, HarnessboxError, older, VERSION, type Run } from 'harnessbox/client';
 
 const custom: Adapter = {
   ...grok,
@@ -38,6 +38,10 @@ const cut: boolean | undefined = searched.result?.eventsTruncated;
 void kept; void cut;
 const canSearch: boolean = (await hb.harnesses()).harnesses[0].webSearch;
 void canSearch;
+const pinned = harnessbox({ socketPath: '/run/harnessbox/hb.sock', token: 't', autoUpdate: false });
+const handed: { version: string; minClient: string } = await pinned.client();
+const behind: boolean = older(VERSION, handed.minClient);
+void behind;
 // @ts-expect-error events is true or false
 hb.run({ user: 'u1', harness: 'codex', prompt: 'x', events: 'all' });
 const hbError: Error = new HarnessboxError(409, 'busy');

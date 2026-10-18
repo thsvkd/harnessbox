@@ -34,8 +34,38 @@ memory, one or two bytes a character plus 32 bytes each; an active run's events 
 
 Every request carries `Authorization: Bearer <token>`. Bodies and answers are JSON. Errors are `{ "error": { "code", "message" } }`
 with 400 (bad input), 401 (token), 404 (unknown, or another client's), 409 (busy, not usable, not waiting for a code), 413 (too
-large), 503 (`status_failed`: a status or logout box failed, out of time say; ask again), 429 (too many runs, logins, request bytes in flight, event streams or answer bytes not yet read), 507 (no room for a run's
+large), 426 (`client_too_old`, below), 503 (`status_failed`: a status or logout box failed, out of time say; ask again), 429 (too many runs, logins, request bytes in flight, event streams or answer bytes not yet read), 507 (no room for a run's
 files now: ask again later). `:user` is `[A-Za-z0-9_-]{1,64}`, your own id for the user.
+
+### Client versions
+
+Every answer carries `harnessbox-version` (this service's release). `src/client.mjs` sends `harnessbox-client: <VERSION>`, the
+release its code last changed in; a client from before 0.5.0 sends none and counts as 0.4.0, and a value that is not `x.y.z` is a
+400 `bad_client_version`. The service logs each client's version once (`client <id> uses client <version>`, eight versions per client), so the operator
+sees which copy each app runs. A client older than `MIN_CLIENT` (`src/server.mjs`, now 0.2.0) gets 426 `client_too_old` on every
+request but `GET /v1/client`.
+
+| Request | Answer |
+|---|---|
+| `GET /v1/client` | `{ version, minClient, source, signature }`: the client this service ships (`src/client.mjs`) and its Ed25519 signature (`src/client.mjs.sig`). |
+
+On a 426 the client (0.5.0 on, `autoUpdate` default true) takes that source, checks the signature against the maintainers' key in
+its own copy, reads the version from the signed text and loads it in memory (a `data:` import; nothing is written) when it is no
+older than its own copy, the newest one that process loaded (for all its client objects, which then use it), or `minClient`; it
+then asks again once. Else the call rejects with
+426 `client_update_failed`. A process loads again after a restart, or when the minimum rises past what it loaded. The service
+cannot hand an app code the maintainers did not sign, nor take a process back under its copy or what it loaded; a signed release
+cannot be revoked, though, short of a new copy in the app. Clients before 0.5.0 send no version and count as 0.4.0, so a minimum
+over 0.2.0 and under 0.5.0 refuses none of them. The app's types stay those of its
+copy, so `MIN_CLIENT` is raised only for a change the client takes in (the wire, not its functions); a change to the functions is
+`/v2`, and a new copy by hand.
+
+Within `/v1` a release may add optional request fields, answer fields, endpoints and error codes; it may not remove or rename a
+field, change one's type, or answer the same request in the same situation differently, except to fix a bug, which the CHANGELOG
+then lists under "API" (0.4.0's 503 `status_failed` for a status box that failed, once "logged out", is one). `test/compat` holds each released client; every one from `MIN_CLIENT` on runs the same scenario against
+the service in the tests, and `src/client.mjs` must be the copy of its own `VERSION`. Releasing a changed client: set `VERSION` to
+the release, copy the file to `test/compat/client-<VERSION>.mjs`, `npm run sign-client` (the key: `HB_SIGNING_KEY`, default
+`~/.config/harnessbox/client-signing-key.pem`, never in the repository).
 
 ### Harnesses and logins
 
@@ -201,7 +231,8 @@ const run = await hb.events(id, (event, r) => console.log(event, r.state, r.stag
 ```
 
 Calls reject with `HarnessboxError` (`status`, `code`) for an answer of the service, or with the socket's own `Error` when there is
-no answer.
+no answer. Copy `src/client.mjs` and `src/client.d.ts` together; from 0.5.0 a copy brings itself up to the service's minimum
+(Client versions, above), so a copy by hand is needed only for new functions or types.
 
 ## Deploy
 
