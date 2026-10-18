@@ -9,14 +9,14 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } fro
 import http from 'node:http';
 import { dirname, join } from 'node:path';
 import { claudeCode, clip, codex, grok } from './adapters.mjs';
-import { ID, readOutBytes } from './box.mjs';
+import { ID, readOutBytes, rmTree } from './box.mjs';
 import { Busy, createRunner } from './runner.mjs';
 
 /** Where every run's folder appears inside its box: prompts, files and tool rules can name /work/... before the run exists. */
 export const BOX_DIR = '/work';
 export const LIMITS = {
   body: 64 * 2 ** 20, prompt: 256 * 1024, files: 2000, filesBytes: 48 * 2 ** 20, outputs: 32, output: 2 * 2 ** 20, outputsBytes: 16 * 2 ** 20,
-  eventsBytes: 2 ** 20, eventBytes: 64 * 1024, eventDepth: 64, eventsCount: 2000, activeRuns: 16, keptRuns: 200, keptBytes: 256 * 2 ** 20, inflightBytes: 128 * 2 ** 20, streams: 32, logins: 4, runTimeoutMs: 2 * 3600e3, validateMs: 10 * 60e3, keepMs: 30 * 60e3, statusFreshMs: 30e3, readyMs: 30e3,
+  eventsBytes: 2 ** 20, eventBytes: 64 * 1024, eventDepth: 64, eventsCount: 2000, activeRuns: 16, keptRuns: 200, keptBytes: 256 * 2 ** 20, inflightBytes: 128 * 2 ** 20, answerBytes: 128 * 2 ** 20, streams: 32, logins: 4, runTimeoutMs: 2 * 3600e3, validateMs: 10 * 60e3, keepMs: 30 * 60e3, statusFreshMs: 30e3, readyMs: 30e3,
 };
 const CODE = /^[\x21-\x7e]{1,2048}$/, MODEL = /^[A-Za-z0-9._:@/-]{1,100}$/;
 const ACTIVE = new Set(['queued', 'running', 'validating']);
@@ -26,7 +26,7 @@ const no = (status, code, message) => { throw new HttpError(status, code, messag
 const sha = (s) => createHash('sha256').update(s).digest();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms).unref());
 /** A relative path of plain segments: no '', '.', '..', NUL or backslash; at most 1024 bytes. */
-const safePath = (p) => typeof p === 'string' && p.length <= 1024 && !p.startsWith('/') && p.split('/').every((s) => s && s !== '.' && s !== '..' && !/[\0\\]/.test(s) && s.length <= 255);
+const safePath = (p) => typeof p === 'string' && Buffer.byteLength(p) <= 1024 && !p.startsWith('/') && p.split('/').every((s) => s && s !== '.' && s !== '..' && !/[\0\\]/.test(s) && Buffer.byteLength(s) <= 255);
 const strings = (v, max, what) => {
   if (v === undefined) return [];
   if (!Array.isArray(v) || v.length > max || !v.every((s) => typeof s === 'string' && s.length <= 4096 && !s.includes('\0'))) no(400, 'bad_request', `${what}: at most ${max} strings`);
@@ -50,10 +50,12 @@ const jsonObject = (v) => { try { const j = JSON.parse(v.trim()); return j !== n
 export function createService({ hb, harnesses, clients, runs: runsDir, models = {}, limits = {}, log = () => {} }) {
   const L = { ...LIMITS, ...limits };
   if (limits.body && !limits.filesBytes) L.filesBytes = Math.floor(limits.body * 0.75); // base64 in JSON
+  L.inflightBytes = Math.max(L.inflightBytes, L.body); // else a body that size is a 429
   const known = new Map(harnesses.map((h) => [h.id, h]));
   const keys = clients.map((c) => {
     if (!ID.test(c.id ?? '') || !/^[0-9a-f]{64}$/.test(c.tokenSha256 ?? '')) throw new Error(`bad client entry ${c.id}`);
     for (const k of ['webSearch', 'events']) if (c[k] !== undefined && typeof c[k] !== 'boolean') throw new Error(`bad client entry ${c.id}: ${k} must be true or false`);
+    if (c.harnesses !== undefined && !(Array.isArray(c.harnesses) && c.harnesses.every((h) => typeof h === 'string'))) throw new Error(`bad client entry ${c.id}: harnesses must be an array of ids`);
     return { id: c.id, hash: Buffer.from(c.tokenSha256, 'hex'), harnesses: c.harnesses ? new Set(c.harnesses) : null, webSearch: c.webSearch === true, events: c.events === true };
   });
   const auth = (req) => {
@@ -92,7 +94,9 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   };
 
   // ---- logins: the runner's session; the service keeps the outcome for keepMs after it ends
-  const view = (x) => ({ state: x.s.state === 'refused' ? 'starting' : x.s.state, url: x.s.url, code: x.s.code, needsCode: x.s.needsCode, startedAt: x.startedAt, expiresAt: x.expiresAt,
+  // expiresAt: the runner's, once the CLI's box started; until then counted from the request (a login behind a run starts later)
+  const view = (x) => ({ state: x.s.state === 'refused' ? 'starting' : x.s.state, url: x.s.url, code: x.s.code, needsCode: x.s.needsCode, startedAt: x.startedAt,
+    expiresAt: x.s.expiresAt ? new Date(x.s.expiresAt).toISOString() : x.expiresAt,
     ...(x.s.error ? { error: x.s.error } : {}), ...(x.status ? { status: x.status } : {}) });
   async function startLogin(c, scoped, h) {
     const k = `${scoped}/${h}`;
@@ -147,6 +151,8 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   const expire = (id) => setTimeout(() => { const x = runs.get(id); if (x) forget(x); }, L.keepMs).unref();
   const emit = (r, event) => { for (const l of r.listeners) { try { l(event); } catch { /* one subscriber cannot end the run or the service */ } } };
   const set = (r, state) => { if (r.state === state || !ACTIVE.has(r.state)) return; r.state = state; if (state === 'running') r.startedAt = new Date().toISOString(); emit(r, 'state'); };
+  // a path the client chose that meets another one is its 400; anything else (the run folders' tmpfs full, say) is not its fault
+  const clash = (bad) => (e) => { if (['EEXIST', 'ENOTDIR', 'EISDIR'].includes(e.code)) return bad(e); throw e; };
   async function createRun(c, b) {
     if (!b || typeof b !== 'object') no(400, 'bad_request', 'a JSON object is required');
     const scoped = userOf(c, b.user), h = harnessOf(c, b.harness).id;
@@ -170,7 +176,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       no(400, 'bad_args', 'args may not carry \\u escapes or a --settings file for this client');
     }
     if (![...outputs, ...readonly].every(safePath) || new Set(outputs).size !== outputs.length) no(400, 'bad_path', 'outputs and readonly are distinct relative paths');
-    if (readonly.some((p) => readonly.some((q) => q !== p && (q.startsWith(`${p}/`) || q === p)))) no(400, 'bad_path', 'readonly folders may not overlap');
+    if (readonly.some((p, i) => readonly.some((q, j) => i !== j && (q === p || q.startsWith(`${p}/`))))) no(400, 'bad_path', 'readonly folders may not overlap');
     let validate = null;
     if (b.validate != null) {
       const argv = strings(b.validate.argv, 64, 'validate.argv'), ms = b.validate.timeoutMs ?? 60e3;
@@ -178,7 +184,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       validate = { argv, ms };
     }
     const files = b.files ?? [];
-    if (!Array.isArray(files) || files.length > L.files || files.reduce((n, f) => n + 1 + (Array.isArray(f?.copies) ? f.copies.length : 0), 0) > L.files) no(400, 'bad_files', `files: at most ${L.files}, including copies`);
+    if (!Array.isArray(files) || files.reduce((n, f) => n + 1 + (Array.isArray(f?.copies) ? f.copies.length : 0), 0) > L.files) no(400, 'bad_files', `files: at most ${L.files}, including copies`);
     const mine = [...runs.values()].filter((r) => r.client === c.id);
     if (mine.filter((r) => ACTIVE.has(r.state)).length >= L.activeRuns) no(429, 'too_many_runs', `at most ${L.activeRuns} active runs per client`);
     if (mine.length >= L.keptRuns) {
@@ -212,12 +218,17 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
           if ((bytes += data.length) > L.filesBytes) no(413, 'too_large', `files: at most ${L.filesBytes} bytes`);
           const ro = readonly.find((p) => path.startsWith(`${p}/`)), to = ro ? join(root, 'ro', path) : join(work, path);
           await mkdir(dirname(to), { recursive: true }).then(() => writeFile(to, data, { flag: 'wx' }))
-            .catch((e) => no(400, 'bad_files', `file ${path} clashes with another file or folder (${e.code})`));
+            .catch(clash((e) => no(400, 'bad_files', `file ${path} clashes with another file or folder (${e.code})`)));
         }
       }
-      for (const p of [...readonly, ...outputs.map(dirname).filter((d) => d !== '.')]) await mkdir(join(work, p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));
-      for (const p of readonly) await mkdir(join(root, 'ro', p), { recursive: true }).catch((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`));
-    } catch (e) { runs.delete(id); if (root) await rm(root, { recursive: true, force: true }); throw e; }
+      for (const p of [...readonly, ...outputs.map(dirname).filter((d) => d !== '.')]) await mkdir(join(work, p), { recursive: true }).catch(clash((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`)));
+      for (const p of readonly) await mkdir(join(root, 'ro', p), { recursive: true }).catch(clash((e) => no(400, 'bad_path', `folder ${p} clashes with a file (${e.code})`)));
+    } catch (e) {
+      runs.delete(id);
+      if (root) await rmTree(root);
+      if (e.code === 'ENOSPC' || e.code === 'EDQUOT') no(507, 'no_space', 'the service has no room for this run\'s files now; ask again later');
+      throw e;
+    }
     log(`run client=${c.id} run=${id} user=${scoped} harness=${h} queued`);
     execute(r, { root, work, prompt: b.prompt, timeoutMs, args, outputs, validate, webSearch: b.webSearch === true, roBinds: readonly.map((p) => [join(root, 'ro', p), join(BOX_DIR, p)]) })
       .catch((e) => log(`error run=${id} ${e?.name ?? 'error'}`)); // never an unhandled rejection: it would end the service
@@ -267,33 +278,38 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       // the client chose the command, and it must not see the user's credential
       if (validate && !signal.aborted && !res.why && (res.code === 0 || res.timedOut)) {
         set(r, 'validating');
-        const v = await hb.exec(r.scoped, r.harness, validate.argv, { dir: work, boxDir: BOX_DIR, roBinds, ms: validate.ms, signal, home: join(root, 'home') });
-        r.validator = { code: v.code, out: v.out, why: v.why };
+        // canceled while it waits for its slot: a cancel like any other (no error, the outputs still read)
+        const v = await hb.exec(r.scoped, r.harness, validate.argv, { dir: work, boxDir: BOX_DIR, roBinds, ms: validate.ms, signal, home: join(root, 'home') })
+          .catch((e) => { if (signal.aborted) return null; throw e; });
+        // a box that never ran the client's command is the service's failure (as a spawn with no process is), not the validator's answer
+        if (v?.why === 'the box did not start') throw new Error('the validator\'s box did not start');
+        if (v) r.validator = { code: v.code, out: v.out, why: v.why };
       }
       // outputs: regular files really at work/<path>, never through a link the box made; too big or missing: null
       const real = await realpath(work);
       let total = 0;
-      r.outputs = {};
+      r.outputs = Object.create(null); // an output named __proto__ is a key like any other
       for (const p of outputs) {
         const bytes = await readOutBytes(real, p, L.output);
-        if (bytes !== null && (total += bytes.length) <= L.outputsBytes) r.outputs[p] = bytes.toString('base64');
-        else r.outputs[p] = null;
+        if (bytes !== null && total + bytes.length <= L.outputsBytes) { total += bytes.length; r.outputs[p] = bytes.toString('base64'); } else r.outputs[p] = null;
       }
-      r.bytes = total + Buffer.byteLength(res.text) + Buffer.byteLength(res.stderr) + Buffer.byteLength(r.validator?.out ?? '') + (r.kept?.mem ?? 0);
+      r.bytes = Math.ceil(total / 3) * 4 + Buffer.byteLength(res.text) + Buffer.byteLength(res.stderr) + Buffer.byteLength(r.validator?.out ?? '') + (r.kept?.mem ?? 0);
       r.state = signal.aborted || res.canceled ? 'canceled' : res.code === 0 && !res.why ? 'done' : 'failed';
     } catch (e) {
       r.error = String(e.message).slice(0, 300);
       r.state = signal.aborted ? 'canceled' : 'failed';
     } finally {
       r.endedAt = new Date().toISOString();
-      await rm(root, { recursive: true, force: true }).catch(() => {});
+      // a folder the box made 0555 too; one that still will not go takes room every client shares: say so
+      await rmTree(root).catch((e) => log(`error run=${r.id} run folder not removed (${e.code ?? e.name})`));
       log(`run client=${r.client} run=${r.id} ${r.state}`);
       emit(r, 'end');
       r.listeners.clear();
       r.final = true;
       if (runs.get(r.id) === r) r.timer = expire(r.id); else forget(r); // forgotten before its end event
       // ended runs hold their outputs (and kept events) in memory: past keptBytes for everybody, the oldest ended runs go first
-      r.bytes ??= r.kept?.mem ?? 0;
+      // not counted above when the run failed past hb.run (its validator rejected, say): what it still holds
+      r.bytes ??= (r.result ? Buffer.byteLength(r.result.text ?? '') + Buffer.byteLength(r.result.stderr ?? '') : 0) + (r.kept?.mem ?? 0);
       let kept = 0;
       for (const x of runs.values()) kept += x.bytes ?? 0;
       for (const x of runs.values()) { if (kept <= L.keptBytes) break; if (!ACTIVE.has(x.state)) { kept -= x.bytes ?? 0; forget(x); } }
@@ -306,8 +322,13 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     streams.set(c.id, (streams.get(c.id) ?? 0) + 1);
     res.on('close', () => streams.set(c.id, streams.get(c.id) - 1));
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
+    res.flushHeaders(); // a stream the service closes early (send) is then a stream that ended, not a connection without an answer
     res.on('error', () => {}); // a subscriber gone mid-write is not the service's error
-    const send = (event) => res.write(`event: ${event}\ndata: ${runJson(r, event === 'end')}\n\n`);
+    const send = (event) => {
+      const data = `event: ${event}\ndata: ${runJson(r, event === 'end')}\n\n`;
+      if (owes(c, Buffer.byteLength(data))) return res.destroy(); // a subscriber that does not read: getRun has the run
+      owe(c, res, data, false);
+    };
     if (!ACTIVE.has(r.state)) { send('end'); return res.end(); }
     send('state');
     const ping = setInterval(() => res.write(': ping\n\n'), 15e3);
@@ -317,12 +338,40 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   }
 
   // ---- HTTP
-  /** text: the body as JSON already (runJson) */
-  const json = (res, status, body, text) => {
+  const json = (res, status, body) => {
     let data;
-    try { data = text ?? (body === undefined ? '' : JSON.stringify(body)); } catch { status = 500; data = JSON.stringify({ error: { code: 'internal', message: 'internal error' } }); }
+    try { data = body === undefined ? '' : JSON.stringify(body); } catch { status = 500; data = JSON.stringify({ error: { code: 'internal', message: 'internal error' } }); }
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(data) });
     res.end(data);
+  };
+  // answer bytes a client has not taken yet (the socket's buffer holds them): a run's answer can be tens of MiB, and a client asking
+  // and never reading would hold the service's memory. One answer always goes (else a run bigger than the cap never could).
+  // A write's bytes are paid back when the socket takes them (its callback) or, all that is left, when the answer closes.
+  const owed = new Map(); // client -> bytes
+  const pending = new WeakMap(); // answer -> { bytes: its own not yet taken, closed }
+  const owes = (c, n) => (owed.get(c.id) ?? 0) > 0 && (owed.get(c.id) ?? 0) + n > L.answerBytes;
+  const add = (c, n) => owed.set(c.id, (owed.get(c.id) ?? 0) + n);
+  const owe = (c, res, data, end) => {
+    if (res.destroyed) return; // the client is gone: Node drops the write and never calls back
+    const n = Buffer.byteLength(data);
+    let p = pending.get(res);
+    if (!p) {
+      p = { bytes: 0, closed: false };
+      pending.set(res, p);
+      res.once('close', () => { p.closed = true; add(c, -p.bytes); p.bytes = 0; });
+    }
+    p.bytes += n;
+    add(c, n);
+    let paid = false;
+    const pay = () => { if (paid || p.closed) return; paid = true; p.bytes -= n; add(c, -n); };
+    if (end) res.end(data, pay); else res.write(data, pay);
+  };
+  /** check: false for the answer to POST /v1/runs (the run started already; a 429 would leave the client without its id) */
+  const runAnswer = (c, res, status, r, check = true) => {
+    const data = runJson(r);
+    if (check && owes(c, Buffer.byteLength(data))) no(429, 'too_many_answers', 'too many answer bytes this client has not read yet');
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'content-length': Buffer.byteLength(data) });
+    owe(c, res, data, true);
   };
   const inflight = new Map(); // client -> body bytes being read
   const body = (c, req) => new Promise((done, fail) => {
@@ -341,16 +390,21 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     req.on('end', () => { if (over) return; add(-n); try { done(n ? JSON.parse(Buffer.concat(chunks)) : null); } catch { fail(new HttpError(400, 'bad_json', 'the body is not JSON')); } });
     req.on('error', (e) => stop(e));
   });
+  // a status or logout box that failed (out of time, its CLI's check broke) is the CLI's answer missing, not the service's error
+  const checked = (p) => p.catch((e) => { if (e instanceof Busy || e instanceof HttpError) throw e; no(503, 'status_failed', String(e.message).slice(0, 200)); });
   async function route(req, res) {
-    const c = auth(req), url = new URL(req.url, 'http://x'), m = req.method, p = url.pathname.split('/').slice(1).map(decodeURIComponent);
+    const c = auth(req), url = URL.parse(req.url, 'http://x') ?? no(400, 'bad_request', 'bad path'), m = req.method, p = url.pathname.split('/').slice(1).map(decodeURIComponent);
     if (p[0] !== 'v1') no(404, 'not_found', 'not found');
     if (m === 'GET' && p.length === 2 && p[1] === 'harnesses') return json(res, 200, { harnesses: allowed(c).map(({ id, name, version, usable, why, webSearch }) => ({ id, name, version, usable, why, webSearch: webSearch === true })) });
     if (p[1] === 'users' && p.length >= 3) {
       const scoped = userOf(c, p[2]);
       if (p.length === 3 && m === 'DELETE') {
         for (const r of runs.values()) if (r.scoped === scoped && ACTIVE.has(r.state)) r.ac.abort();
+        // the logins the purge ends (the runner cancels them): one started while it waits for the locks stays, to see or cancel
+        const ended = [...sessions].filter(([k]) => k.startsWith(`${scoped}/`));
         await hb.purge(scoped);
-        for (const k of [...statuses.keys(), ...sessions.keys()]) if (k.startsWith(`${scoped}/`)) { statuses.delete(k); sessions.delete(k); }
+        for (const [k, x] of ended) if (sessions.get(k) === x) sessions.delete(k);
+        for (const k of [...statuses.keys()]) if (k.startsWith(`${scoped}/`)) statuses.delete(k);
         log(`purge client=${c.id} user=${scoped}`);
         return json(res, 204);
       }
@@ -367,9 +421,9 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
         return json(res, 200, { harnesses: list });
       }
       const h = harnessOf(c, p[4]).id, k = `${scoped}/${h}`;
-      if (p.length === 5 && m === 'GET') return json(res, 200, { harness: h, ...(await status(scoped, h)) });
+      if (p.length === 5 && m === 'GET') return json(res, 200, { harness: h, ...(await checked(status(scoped, h))) });
       if (p.length === 6 && p[5] === 'logout' && m === 'POST') {
-        const s = await hb.logout(scoped, h, { waitMs: 2000 });
+        const s = await checked(hb.logout(scoped, h, { waitMs: 2000 }));
         remember(scoped, h, s);
         log(`logout client=${c.id} user=${scoped} harness=${h}`);
         return json(res, 200, { harness: h, ...s });
@@ -387,9 +441,9 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       }
     }
     if (p[1] === 'runs') {
-      if (p.length === 2 && m === 'POST') { const r = await createRun(c, await body(c, req)); return json(res, 202, undefined, runJson(r)); }
+      if (p.length === 2 && m === 'POST') { const r = await createRun(c, await body(c, req)); return runAnswer(c, res, 202, r, false); }
       const r = runOf(c, p[2] ?? '');
-      if (p.length === 3 && m === 'GET') return json(res, 200, undefined, runJson(r));
+      if (p.length === 3 && m === 'GET') return runAnswer(c, res, 200, r);
       if (p.length === 3 && m === 'DELETE') {
         r.ac.abort(); // a queued run leaves the user's lock and the slot queue at once; the run ends canceled
         return json(res, 204);
@@ -398,7 +452,8 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     }
     no(404, 'not_found', 'not found');
   }
-  const server = http.createServer((req, res) => {
+  // the timeouts below are checked every connectionsCheckingInterval (Node's default 30 s): each second, so 10 s means 10-11 s
+  const server = http.createServer({ connectionsCheckingInterval: 1000 }, (req, res) => {
     route(req, res).catch((e) => {
       const err = e instanceof HttpError ? e : e instanceof Busy ? new HttpError(409, 'busy', 'this user\'s harness is busy (a login or a run); ask again later')
         : e instanceof URIError ? new HttpError(400, 'bad_request', 'bad path') : new HttpError(500, 'internal', 'internal error');
@@ -408,35 +463,54 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
       json(res, err.status, { error: { code: err.code, message: err.message } });
     });
   });
+  // for everybody on the socket, before any token: whoever can reach it can hold them (docs/service.md, one service per set of apps
+  // that trust each other); a connection that has not sent its headers in 10 s goes
   server.maxConnections = 512;
+  server.headersTimeout = 10e3;
   server.requestTimeout = 5 * 60e3;
   return { server, runs, close: () => { for (const r of runs.values()) r.ac.abort(); server.close(); server.closeAllConnections(); } };
+}
+
+/** HB_LISTEN: `host:port` or `[v6]:port` is TCP ({ host, port }); anything else ('/run/harnessbox/hb.sock', '[::1]') a socket path. */
+export function listenOf(s) {
+  const m = /^(?:\[([^\]]+)\]|([^/[][^:]*)):(\d+)$/.exec(s);
+  return m ? { host: m[1] ?? m[2], port: Number(m[3]) } : { path: s };
 }
 
 // ---- main: configuration from the environment (docs/service.md)
 async function main() {
   const env = process.env, all = [claudeCode, codex, grok];
-  // a run's stdout + stderr together (Claude's stream-json carries every image it reads); unset: the runner's 8 MiB
-  const outputBytes = env.HB_MAX_OUTPUT_BYTES === undefined ? undefined : Number(env.HB_MAX_OUTPUT_BYTES);
-  if (outputBytes !== undefined && (!/^[1-9][0-9]*$/.test(env.HB_MAX_OUTPUT_BYTES) || !Number.isSafeInteger(outputBytes))) throw new Error('HB_MAX_OUTPUT_BYTES must be a positive integer (bytes)');
-  const want = (env.HB_HARNESSES ?? all.map((a) => a.id).join(',')).split(',');
+  const intEnv = (name, { max = Number.MAX_SAFE_INTEGER, unit = '' } = {}) => {
+    const v = env[name];
+    if (v === undefined) return undefined;
+    if (!/^[1-9][0-9]*$/.test(v) || Number(v) > max) throw new Error(`${name} must be a positive integer${unit}, at most ${max}`);
+    return Number(v);
+  };
+  // a run's stdout + stderr together (Claude's stream-json carries every image it reads); unset: the runner's 8 MiB. A body is parsed
+  // as one string: V8's longest is 2^29 - 24 characters
+  const outputBytes = intEnv('HB_MAX_OUTPUT_BYTES', { unit: ' (bytes)' }), bodyBytes = intEnv('HB_MAX_BODY', { max: 2 ** 29 - 24, unit: ' (bytes)' });
+  const maxJobs = intEnv('HB_MAX_JOBS', { max: 1000 }) ?? 3, maxQuick = intEnv('HB_MAX_QUICK', { max: 1000 }) ?? 4;
+  const want = (env.HB_HARNESSES ?? all.map((a) => a.id).join(',')).split(',').map((s) => s.trim());
+  for (const id of want) if (!all.some((a) => a.id === id)) throw new Error(`HB_HARNESSES: no harness ${JSON.stringify(id)} (${all.map((a) => a.id).join(', ')})`);
   const adapters = all.filter((a) => want.includes(a.id)), envKey = (a) => a.id.toUpperCase().replace(/-/g, '_');
   const pick = (prefix) => Object.fromEntries(adapters.flatMap((a) => (env[`${prefix}${envKey(a)}`] ? [[a.id, env[`${prefix}${envKey(a)}`]]] : [])));
-  const clients = JSON.parse(await readFile(env.HB_CLIENTS ?? '/etc/harnessbox/clients.json', 'utf8')).clients;
+  const clientsFile = await realpath(env.HB_CLIENTS ?? '/etc/harnessbox/clients.json');
+  const clients = JSON.parse(await readFile(clientsFile, 'utf8')).clients;
   const runs = env.HB_RUNS ?? '/tmp/hb-runs', listen = env.HB_LISTEN ?? '/run/harnessbox/hb.sock';
   const log = (l) => console.log(`[harnessbox] ${l}`);
   // a restart forgets every run: their folders go too
   await mkdir(runs, { recursive: true, mode: 0o700 });
-  for (const n of await readdir(runs)) await rm(join(runs, n), { recursive: true, force: true });
+  for (const n of await readdir(runs)) await rmTree(join(runs, n));
   const hb = await createRunner({ homes: env.HB_HOMES ?? '/homes', adapters, bins: pick('HB_BIN_'), pins: pick('HB_PIN_'), bwrap: env.HB_BWRAP ?? 'bwrap', socat: env.HB_SOCAT ?? 'socat',
-    maxJobs: Number(env.HB_MAX_JOBS) || 3, maxQuick: Number(env.HB_MAX_QUICK) || 4, maxOutputBytes: outputBytes, log });
+    maxJobs, maxQuick, maxOutputBytes: outputBytes, log,
+    hide: /^\/(usr|etc)\//.test(clientsFile) ? [clientsFile] : [] }); // every box sees /etc and /usr: not the clients' token hashes
   const harnesses = await hb.detect();
   for (const h of harnesses) log(`${h.id} ${h.version ?? '-'} ${h.usable ? 'usable' : `not usable: ${h.why}`}`);
-  const models = Object.fromEntries(Object.entries(pick('HB_MODELS_')).map(([k, v]) => [k, v.split(',')]));
-  const svc = createService({ hb, harnesses, clients, runs, models, limits: env.HB_MAX_BODY ? { body: Number(env.HB_MAX_BODY) } : {}, log });
-  const tcp = /^([^/][^:]*):(\d+)$/.exec(listen);
+  const models = Object.fromEntries(Object.entries(pick('HB_MODELS_')).map(([k, v]) => [k, v.split(',').map((s) => s.trim()).filter(Boolean)]));
+  const svc = createService({ hb, harnesses, clients, runs, models, limits: bodyBytes ? { body: bodyBytes } : {}, log });
+  const at = listenOf(listen), tcp = !at.path;
   if (!tcp) { await mkdir(dirname(listen), { recursive: true }); await rm(listen, { force: true }); }
-  await new Promise((done, fail) => { svc.server.once('error', fail); if (tcp) svc.server.listen(Number(tcp[2]), tcp[1], done); else svc.server.listen(listen, done); });
+  await new Promise((done, fail) => { svc.server.once('error', fail); if (tcp) svc.server.listen(at.port, at.host, done); else svc.server.listen(listen, done); });
   // the socket's folder is a volume shared with the client apps only; the bearer token is the other half
   if (!tcp) await chmod(listen, 0o666);
   log(`listening on ${listen} for ${clients.length} client(s)`);

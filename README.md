@@ -9,7 +9,7 @@ Use it as a library in your own runner process (below), or run it as a **service
 each app with its own token and its own users (`node src/server.mjs`, the image's default command; [docs/service.md](docs/service.md)).
 
 Extracted on 2026-10-16 from review-automation's per-user runner (`app/runner/box.mjs`, `rva-runner.mjs`), deployed there for
-Claude Code and Codex. Node 24, Linux (arm64 or x64), bubblewrap, socat; no runtime npm dependencies. Version 0.3.0.
+Claude Code and Codex. Node 24.2 or later (`import.meta.main`), Linux (arm64 or x64), bubblewrap, socat; no runtime npm dependencies. Version 0.4.0.
 Install the package tarball from this repository's release, or use a Git dependency. TypeScript declarations and the deployment
 probe are included. The package is not published to the public npm registry.
 TypeScript consumers need `@types/node` in their development dependencies.
@@ -25,7 +25,7 @@ web apps ── unix socket, bearer token ── src/server.mjs (or your own run
 ## Use
 
 ```js
-import { claudeCode, codex, createRunner, grok } from 'harnessbox';
+import { claudeCode, codex, createRunner, grok, readOut } from 'harnessbox';
 
 const hb = await createRunner({ homes: '/homes', adapters: [claudeCode, codex, grok], socat: '/usr/bin/socat', maxJobs: 3, log: console.log });
 await hb.detect(); // [{ id, version, usable, why, has }] — each CLI checked in a box: version pin, options, own checks
@@ -56,13 +56,14 @@ process.once('SIGTERM', async () => { await hb.close(); process.exit(143); });
 | `adapters` | (required) | `claudeCode`, `codex`, `grok`, or your own (docs/adapters.md). |
 | `bins`, `pins` | PATH, none | Binary and exact version per harness id. Another version is not usable. |
 | `bwrap`, `socat` | on PATH | |
-| `maxJobs` | 3 | Jobs at once; more wait for a slot. Logins are one per user and harness; there is no global cap on them. |
+| `maxJobs` | 3 | Jobs (`run`) and `exec` boxes at once; more wait for a slot. Logins are one per user and harness; there is no global cap on them. |
 | `maxQuick` | 2 | Status and logout boxes at once; more throw `Busy`. A status waits at most `waitMs` (5 s) for the user's lock. |
 | `maxProcs` | 128 | Per box, watchdog (2 s). The in-box RLIMIT_NPROC is 4x (threads count). |
 | `maxBytes`, `maxEntries` | 1 GiB, 20000 | Home + job folder per box, watchdog. |
 | `maxOutputBytes` | 8 MiB | Cumulative stdout + stderr per job. Stops a box before more output reaches its event parser or text accumulator. |
 | `log` | none | Egress denials (`egress deny <label> <host>:<port> <why>`) and watchdog notes. Never URLs, codes or credentials. |
 | `passEnv` | `{}` | Extra variables in every box (tests). |
+| `hide` | `[]` | Files under `/usr` or `/etc` (every box sees those read-only) that no box can read, such as your own secrets there. Each must be a regular file at startup. |
 
 One lock per user and harness: a login, status, logout and job of the same credential never overlap (both Claude Code and Codex
 rotate refresh tokens; two refreshes at once log the user out). The home is scrubbed to the adapter's credential files before every
@@ -70,7 +71,10 @@ box and after every job, so a box cannot plant hooks, shell start-up files or MC
 
 One runner process must exclusively own a `homes` root. Locks and concurrency counters are in memory; they do not coordinate
 multiple processes or replicas. Give replicas separate roots and stable user routing, or add coordination in the host app.
-Resource limits must be positive safe integers. Missing bubblewrap/socat and unsupported seccomp architectures fail startup.
+Resource limits must be positive safe integers, and `timeoutMs`, `ms` and `waitMs` whole milliseconds up to 2^31 - 1. Missing
+bubblewrap/socat, unsupported seccomp architectures, a Node or CLI folder (or `/usr`, `/etc`) that holds the runner user's home, the
+homes root or the temp folder, or is `/` (every box would see it read-only), and a temp folder whose path leaves no room for the boxes' unix sockets fail startup. User ids are `user` or
+`scope/user`, one form per runner (`alice/codex` would sit inside `alice`'s Codex home).
 Concurrent `detect()` calls are serialized so their temporary probe homes cannot interfere.
 
 `run(..., { signal })` can be canceled while waiting for either the user's lock or a job slot, returning `canceled: true` without
@@ -144,15 +148,24 @@ The boundaries, honestly:
   `pivot_root` for bubblewrap, which widens that surface for the runner process too.
 - **One uid for all users.** All homes belong to the runner's uid; the box's mount namespace is what separates users. An escape from a
   box sees every home. Separate uids per user would need a setuid helper or root in the container; not done.
-- **Nested user namespaces for Codex.** Codex's own sandbox needs them, so its job boxes run without `--disable-userns`.
-- **Memory is not limited per box.** /tmp and /run in a box are 256 MiB tmpfs, the watchdog caps the home and job folder (1 GiB) and
+- **Nested user namespaces for Codex.** Codex's own sandbox needs them, so its job boxes run without `--disable-userns`. A model
+  command in that sandbox can therefore mount a tmpfs of its own, which no cap here measures (only a per-box memory cgroup would).
+- **Memory is not limited per box.** /tmp, /run and /dev/shm in a box are 256 MiB tmpfs (bytes, not inodes: many empty files still
+  take kernel memory), the root and /dev are read-only, the watchdog caps the home and job folder (1 GiB) and
   processes (128); a CLI's own memory is only bounded by the container's `mem_limit`, and only if the kernel's memory cgroup is on
   (the Raspberry Pi kernel ships with `cgroup_disable=memory`). One user can exhaust memory for all.
-- **Storage checks are not filesystem quotas.** The watchdog runs every 2 s, so a box can overshoot between checks. An unreadable
-  directory or another inspection error stops the box instead of hiding usage. Use filesystem quotas when storage needs a hard
+- **Storage checks are not filesystem quotas.** The watchdog runs every 2 s, so a box can overshoot between checks. It counts files
+  that have a name (as bytes: a name that is not UTF-8 counts too): a deleted file a process still holds open takes room until it
+  is closed, at the latest when the box ends, and is never counted. An unreadable directory or another inspection error stops the
+  box instead of hiding usage. Use filesystem quotas when storage needs a hard
   per-user limit. The host app owns job-folder cleanup, including restoring directory permissions after a hostile job.
-- **A user's own credential is readable in their own box** (the CLI must read it). The host allowlist is the only limit on where it
-  can go. A box can also overwrite its own kept credential file, which then persists: a job could swap in another account's
+- **The egress check is the CONNECT host and the TLS name.** A tunnel opens to an allowed host on 443 only, and carries only TLS whose
+  first ClientHello names that host (`server_name`, in one record, without ECH); anything else is closed unsent. It does not look
+  further: a second ClientHello after a HelloRetryRequest, and the HTTP requests inside the TLS session (their Host header, a
+  connection reused for another name on the same certificate), are not checked. On an edge shared by many sites (Cloudflare's,
+  behind chatgpt.com, auth.openai.com and the x.ai hosts) that may still reach another site there.
+- **A user's own credential is readable in their own box** (the CLI must read it). The host allowlist (above) is the only limit on
+  where it can go. A box can also overwrite its own kept credential file, which then persists: a job could swap in another account's
   credential, and the user's later jobs would run (and send their material) under that account.
 - **The CLI is not a boundary inside its box.** The model's commands run as the same uid in the same pid namespace and, without Yama,
   can ptrace the CLI: read its memory, write its stdout. The runner treats everything a box prints or writes as hostile input.

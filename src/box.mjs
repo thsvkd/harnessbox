@@ -1,10 +1,13 @@
 // Box primitives: bubblewrap arguments, the per-box egress proxy, the box's seccomp filter, the home scrub, the safe file reader and
 // the watchdog's /proc and disk counts. Pure helpers, no side effects on import; runner.mjs wires them up.
+import { execFile } from 'node:child_process';
 import dns from 'node:dns';
 import { constants } from 'node:fs';
-import { chmod, lstat, open, opendir, readdir, readFile, readlink, rm } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { chmod, lstat, open, opendir, readdir, readFile, readlink, rename, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { isAbsolute, join } from 'node:path';
+import { promisify } from 'node:util';
 
 /** User and harness ids: they become folder names under the homes root. */
 export const ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -19,7 +22,42 @@ export const privateIp = (ip) => !net.isIPv4(ip) || PRIVATE.check(ip, 'ipv4');
 const clean = (s) => (/^[A-Za-z0-9.-]{1,253}$/.test(s ?? '') ? s : '<bad>'); // the box writes this string; never let it shape the log
 
 /**
+ * The host name a TLS ClientHello at the start of buf asks for (its server_name, lowercased): undefined while the first record is
+ * still incomplete; null when it is no ClientHello in one record, names no single host, or offers ECH (whose real name is hidden).
+ */
+export function helloSni(buf) {
+  if (buf.length < 5) return undefined;
+  if (buf[0] !== 0x16 || buf[1] !== 3) return null; // a handshake record
+  const len = buf.readUInt16BE(3);
+  if (len > 16384) return null;
+  if (buf.length < 5 + len) return undefined;
+  const h = buf.subarray(5, 5 + len);
+  try {
+    if (h[0] !== 1 || 4 + h.readUIntBE(1, 3) !== h.length) return null; // a ClientHello filling the record (not split over two)
+    let i = 4 + 2 + 32; // type, length, version, random
+    i += 1 + h[i]; // session id
+    i += 2 + h.readUInt16BE(i); // cipher suites
+    i += 1 + h[i]; // compression methods
+    const end = i + 2 + h.readUInt16BE(i);
+    if (end !== h.length) return null;
+    let name = null;
+    for (i += 2; i < end;) {
+      const type = h.readUInt16BE(i), n = h.readUInt16BE(i + 2), d = h.subarray(i + 4, i + 4 + n);
+      i += 4 + n;
+      if (i > end || type === 0xfe0d) return null; // encrypted_client_hello
+      if (type !== 0) continue;
+      // server_name: a list holding exactly one host_name
+      if (name !== null || d.length < 5 || d.readUInt16BE(0) !== d.length - 2 || d[2] !== 0 || 5 + d.readUInt16BE(3) !== d.length) return null;
+      name = d.subarray(5).toString('latin1').toLowerCase();
+    }
+    return name;
+  } catch { return null; } // read past the end
+}
+
+/**
  * Per-box CONNECT proxy on a unix socket (0600). CONNECT <allowed host>:443 only, to the IPv4 address it checked; no plain-HTTP path.
+ * The tunnel carries TLS whose ClientHello names that same host (helloSni): an edge shared by many sites (Cloudflare's, behind
+ * chatgpt.com and api.x.ai) routes by that name, so a CONNECT to an allowed host with another name inside would reach any of them.
  * Every socket has an error handler: a broken or hostile client never ends the runner. Resolves to the net.Server.
  */
 export function startProxy(sockPath, { allow, label, log, lookup = dns.promises.lookup, connect = net.connect }) {
@@ -54,12 +92,21 @@ export function startProxy(sockPath, { allow, label, log, lookup = dns.promises.
       c.on('close', () => up.destroy());
       up.on('close', () => c.destroy());
       up.on('connect', () => {
-        c.setTimeout(0);
         c.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        const rest = head.subarray(end + 4);
-        if (rest.length) up.write(rest);
-        c.pipe(up).pipe(c);
+        let hello = head.subarray(end + 4);
+        const check = () => {
+          const sni = helloSni(hello);
+          if (sni === undefined) return; // more of the first record to come (within the 10 s timeout)
+          c.off('data', more);
+          if (sni !== host) { log(`egress deny ${label} ${clean(host)}:443 sni ${clean(sni)}`); return c.destroy(); }
+          c.setTimeout(0);
+          up.write(hello);
+          c.pipe(up).pipe(c);
+        };
+        const more = (d) => { hello = Buffer.concat([hello, d]); check(); };
+        c.on('data', more);
         c.resume();
+        check();
       });
     };
     c.on('data', onData);
@@ -72,33 +119,65 @@ export function startProxy(sockPath, { allow, label, log, lookup = dns.promises.
   });
 }
 
+const run = promisify(execFile);
+/**
+ * rm -rf that also takes what a box can make a plain rm fail on (a box runs as the runner's uid): folders it made 0555 or 000, and a
+ * chain of folders deeper than PATH_MAX (Node's rm works on whole paths: ENAMETOOLONG). Only once a plain rm is refused: then
+ * coreutils, which walk folder by folder (no path length limit) and never follow a link inside the tree: chmod -R u+rwx, rm -rf.
+ * For trees no box is writing to any more (an ended run's folder, a home under its lock).
+ */
+export async function rmTree(path) {
+  try { return await rm(path, { recursive: true, force: true }); } catch (e) { if (!['EACCES', 'EPERM', 'ENAMETOOLONG'].includes(e.code)) throw e; }
+  if ((await lstat(path)).isSymbolicLink()) return rm(path, { force: true }); // the link itself, never what it points at
+  await run('chmod', ['-R', 'u+rwx', '--', path]).catch(() => {}); // some entries may refuse; rm says what is left
+  await run('rm', ['-rf', '--one-file-system', '--', path]);
+}
+
+const KEPT_MAX = 1024 * 1024;
 /**
  * Remove everything in the home but the credential files: keep lists paths relative to the home ('.claude/.credentials.json'), kept
  * only while they are regular files in real folders (lstat only: a symlink is removed, never followed). jsonKeys: for a kept JSON
- * file, the top-level keys that survive; the rest of it is rewritten away (a file that does not parse or passes 1 MB is removed).
+ * file, the top-level keys that survive; the rest of it is rewritten away (a file that does not parse is removed). A kept file past
+ * 1 MiB is removed.
  */
 export async function scrubHome(home, keep = [], jsonKeys = {}) {
+  // the home and the folders kept in it back to 0700, kept files to 0600 (what the runner makes them): a box could chmod them so
+  // that nothing in them can be removed, read or rewritten, and every later box of that user would fail
   const walk = async (dir, rel) => {
-    for (const name of await readdir(dir)) {
+    await chmod(dir, 0o700); // a real folder: lstat said so (the home: below)
+    // names as bytes: one that is not UTF-8 (a box can make it) read as a string is another name, which lstat does not find
+    for (const raw of await readdir(dir, { encoding: 'buffer' })) {
+      const name = raw.toString();
+      if (!Buffer.from(name).equals(raw)) { // never a kept name: renamed to one coreutils can be handed, then removed
+        const to = join(dir, `.hb-rm-${randomBytes(8).toString('hex')}`);
+        await rename(Buffer.concat([Buffer.from(`${dir}/`), raw]), to);
+        await rmTree(to);
+        continue;
+      }
       const r = rel ? `${rel}/${name}` : name, p = join(dir, name), s = await lstat(p);
-      if (s.isFile() && keep.includes(r)) { if (jsonKeys[r]) await keepKeys(p, s.size, jsonKeys[r]); continue; }
+      if (s.isFile() && keep.includes(r)) {
+        if (s.size > KEPT_MAX) await rm(p, { force: true }); // no credential is that big: a box filled it to break the user's next boxes
+        else if (jsonKeys[r]) await keepKeys(p, jsonKeys[r]);
+        else await chmod(p, 0o600);
+        continue;
+      }
       if (s.isDirectory() && keep.some((k) => k.startsWith(`${r}/`))) { await walk(p, r); continue; }
-      await rm(p, { recursive: true, force: true });
+      await rmTree(p);
     }
   };
+  if (!(await lstat(home)).isDirectory()) throw new Error('the home is not a folder');
   await walk(home, '');
 }
-async function keepKeys(file, size, keys) {
+async function keepKeys(file, keys) { // at most KEPT_MAX bytes (scrubHome)
   let fh, j = null;
-  if (size <= 1024 * 1024) {
-    try {
-      fh = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      j = JSON.parse(await fh.readFile('utf8'));
-    } catch { /* removed below */ } finally { await fh?.close(); }
-  }
-  if (!j || typeof j !== 'object' || Array.isArray(j)) return rm(file, { force: true });
-  const out = await open(file, constants.O_WRONLY | constants.O_TRUNC | constants.O_NOFOLLOW);
-  try { await out.chmod(0o600); await out.writeFile(JSON.stringify(Object.fromEntries(keys.filter((k) => k in j).map((k) => [k, j[k]])), null, 2)); } finally { await out.close(); }
+  try {
+    fh = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    j = JSON.parse(await fh.readFile('utf8'));
+  } catch { /* removed below */ } finally { await fh?.close(); }
+  await rm(file, { force: true });
+  if (!j || typeof j !== 'object' || Array.isArray(j)) return;
+  // written anew (a box may have made the old one 0400)
+  await writeFile(file, JSON.stringify(Object.fromEntries(keys.filter((k) => k in j).map((k) => [k, j[k]])), null, 2), { flag: 'wx', mode: 0o600 });
 }
 
 /**
@@ -153,15 +232,16 @@ export async function countDescendants(rootPids, procDir = '/proc') {
  * Bytes are the larger of size and allocated blocks (including fallocate --keep-size). */
 export async function diskUse(roots, cap = 20000) {
   let bytes = 0, entries = 0;
-  const todo = [...roots];
+  // paths as bytes: a name that is not UTF-8, read as a string, is another name that lstat does not find (and was never counted)
+  const todo = roots.map((r) => Buffer.from(r)), slash = Buffer.from('/');
   while (todo.length && entries <= cap) {
     const dir = todo.pop();
     let directory;
-    try { directory = await opendir(dir); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+    try { directory = await opendir(dir, { encoding: 'buffer' }); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
     for await (const entry of directory) {
       if (++entries > cap) break;
       try {
-        const path = join(dir, entry.name), s = await lstat(path);
+        const path = Buffer.concat([dir, slash, entry.name]), s = await lstat(path);
         bytes += Math.max(s.size, s.blocks * 512);
         if (s.isDirectory()) todo.push(path);
       } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -197,27 +277,33 @@ export function seccompFilter(arch = process.arch) {
 
 /**
  * bubblewrap argv for one box. Only <home> and <dir> (seen at boxDir inside, by default the same path) are writable; /usr and /etc read-only; fresh /proc, /dev and 256 MB /tmp and
- * /run; no network but, with net 'proxy', loopback :3128 that socat bridges to the per-box proxy socket. env: variables on top of
+ * /run and /dev/shm; the root and /dev themselves read-only (bwrap's own tmpfs, unsized: a write there would take memory past every
+ * cap); no network but, with net 'proxy', loopback :3128 that socat bridges to the per-box proxy socket. env: variables on top of
  * HOME, PATH, USER, LANG and SHELL (nothing of the runner's environment gets in). roBinds: paths (or [src, dest]) bound read-only
- * after the home and the folder (CLI folders outside /usr, a pristine copy of something the box must not change). maxTasks:
+ * after the home and the folder (CLI folders outside /usr, a pristine copy of something the box must not change). hide: files under
+ * /usr or /etc the box cannot read (a service's clients file). maxTasks:
  * RLIMIT_NPROC (processes and threads) set inside the box, where the kernel counts it per user namespace, so it caps this box alone.
  * nested: the box may create user namespaces (a CLI's own sandbox may need them); otherwise --disable-userns keeps the kernel's userns
- * surface away from the model's commands. seccomp: the filter (seccompFilter) is read from fd 3.
+ * surface away from the model's commands. seccomp: the filter (seccompFilter) is read from fd 3. status: bwrap reports on fd 4 (its
+ * "exit-code" line comes only from a command that ran: a box whose setup failed has none).
  */
-export function boxArgs({ home, dir, boxDir = dir, net, sock, socat, path, env = {}, roBinds = [], chdir, cmd, maxTasks = 512, nested = false, seccomp = false }) {
-  const a = ['--die-with-parent', '--new-session', '--unshare-all', ...(nested ? [] : ['--unshare-user', '--disable-userns']), '--cap-drop', 'ALL', '--clearenv',
+export function boxArgs({ home, dir, boxDir = dir, net, sock, socat, path, env = {}, roBinds = [], hide = [], chdir, cmd, maxTasks = 512, nested = false, seccomp = false, status = false }) {
+  const a = [...(status ? ['--json-status-fd', '4'] : []), '--die-with-parent', '--new-session', '--unshare-all', ...(nested ? [] : ['--unshare-user', '--disable-userns']), '--cap-drop', 'ALL', '--clearenv',
     '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/sbin', '/sbin', '--symlink', 'usr/lib', '/lib',
     '--symlink', 'usr/lib64', '/lib64', '--ro-bind', '/etc', '/etc', // x64 ELF binaries need /lib64/ld-linux-x86-64.so.2
-    '--proc', '/proc', '--dev', '/dev', '--size', String(BOX_TMP_BYTES), '--tmpfs', '/tmp', '--size', String(BOX_TMP_BYTES), '--tmpfs', '/run',
+    // --dev's own tmpfs is unsized: /dev read-only but for a sized /dev/shm (its nodes are binds, they still open)
+    '--proc', '/proc', '--dev', '/dev', '--size', String(BOX_TMP_BYTES), '--tmpfs', '/dev/shm', '--remount-ro', '/dev', '--size', String(BOX_TMP_BYTES), '--tmpfs', '/tmp', '--size', String(BOX_TMP_BYTES), '--tmpfs', '/run',
     '--bind', home, home, ...(dir ? ['--bind', dir, boxDir] : [])];
   for (const b of roBinds) a.push('--ro-bind', ...(Array.isArray(b) ? b : [b, b]));
+  for (const f of hide) a.push('--ro-bind', '/dev/null', f); // files of the runner's under /usr or /etc: a nodev device node there, unreadable
   if (chdir) a.push('--chdir', chdir);
   if (seccomp) a.push('--seccomp', '3');
   for (const [k, v] of Object.entries({ HOME: home, PATH: path, USER: 'box', LANG: 'C.UTF-8', SHELL: '/bin/bash', ...env })) a.push('--setenv', k, String(v));
   const nproc = `ulimit -u ${Math.max(1, Math.floor(Number(maxTasks)))}; `;
-  if (net !== 'proxy') return [...a, '/bin/bash', '-c', `${nproc}exec "$@"`, 'box', ...cmd];
+  const ro = ['--remount-ro', '/']; // after the last mount
+  if (net !== 'proxy') return [...a, ...ro, '/bin/bash', '-c', `${nproc}exec "$@"`, 'box', ...cmd];
   const proxy = 'http://127.0.0.1:3128';
-  a.push('--ro-bind', sock, '/run/egress.sock');
+  a.push('--ro-bind', sock, '/run/egress.sock', ...ro);
   for (const k of ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy']) a.push('--setenv', k, proxy);
   for (const k of ['NO_PROXY', 'no_proxy']) a.push('--setenv', k, 'localhost,127.0.0.1');
   return [...a, '/bin/bash', '-c', `${nproc}s=$1; shift; "$s" TCP-LISTEN:3128,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/egress.sock 2>/dev/null & i=0; `

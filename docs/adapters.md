@@ -54,16 +54,20 @@ Rules the runner relies on:
   everything. The runner refuses a URL that is not `https:` on one of `urlHosts`, so a planted or changed CLI cannot send the user
   elsewhere.
 - `status.parse` never throws. Return `loggedIn: false` for anything it does not recognise.
-- `job.event` gets each stdout line that parses as JSON. Count `acc.reports` only for real usage reports: with none, the runner marks
+- `job.event` gets each stdout line that parses as a JSON object (an array or a scalar line is no event). Count `acc.reports` only for real usage reports: with none, the runner marks
   the usage `unknown` instead of reporting zero. Prefer totals from a final event over summing per-turn events, and say in a comment
   whether the CLI's input count includes cache tokens.
+- The CLI's TLS to its hosts must start with a ClientHello naming the host it asked the proxy for (`server_name`, in one record,
+  without ECH, which no current CLI sends): the proxy closes any other tunnel unsent (`egress deny … sni`). A CLI that names
+  another host inside a CONNECT (a pinned edge, say) fails whatever `hosts` holds: it must CONNECT to the host its ClientHello names
+  (and that host must be on `hosts`).
 - Anything the job writes and the runner reads (a last-message file, say) goes through `readOut(dir, name)` in `job.finish`, never
   `readFile`: the box could have replaced it with a link to another user's credentials.
 - `webSearch: true` on the adapter says `job.command` honours `webSearch` (it is `false` unless the caller asked): turn on only the
   CLI's own server-side search, by replacing the value that turns it off, and never add a host for it. Without the property the
   runner refuses a run with `webSearch`.
-- Keep the prompt off the command line if the CLI can read it from stdin or a file; the runner refuses prompts starting with `-` when
-  they are an argument.
+- Keep the prompt off the command line if the CLI can read it from stdin or a file. The runner refuses prompts starting with `-`
+  always, stdin or not, so an adapter may put it on the command line.
 
 ## 3. Prove it
 

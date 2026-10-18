@@ -6,13 +6,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { claudeCode, codex, createRunner, grok } from '../src/index.mjs';
+import { Busy, claudeCode, codex, createRunner, grok } from '../src/index.mjs';
 import { harnessbox, HarnessboxError } from '../src/client.mjs';
-import { BOX_DIR, createService } from '../src/server.mjs';
+import { BOX_DIR, createService, listenOf } from '../src/server.mjs';
 
 const HERE = import.meta.dirname;
 const FAKE = { 'claude-code': join(HERE, 'fake-claude'), codex: join(HERE, 'fake-codex'), grok: join(HERE, 'fake-grok') };
@@ -56,7 +57,7 @@ test('service: auth, harness lists per client, logins through the API, status an
     // Claude Code: URL, then the pasted code; Codex: URL and device code
     let s = await w.a.login('u1', 'claude-code');
     assert.deepEqual([s.state, s.url, s.code, s.needsCode], ['waiting', 'https://claude.com/cai/oauth/authorize?code=true&state=fake-state', null, true]);
-    assert.ok(Date.parse(s.expiresAt) - Date.parse(s.startedAt) === 10 * 60e3);
+    assert.ok(Date.parse(s.expiresAt) - Date.parse(s.startedAt) > 10 * 60e3, 'the runner\'s: from its box, which starts after the request');
     await assert.rejects(w.a.submitCode('u1', 'claude-code', 'has space'), { status: 400 });
     assert.equal(await w.a.submitCode('u1', 'claude-code', 'good-code'), null);
     await assert.rejects(w.a.submitCode('u1', 'claude-code', 'good-code'), { status: 409 });
@@ -279,12 +280,14 @@ test('main: a client entry whose webSearch or events is not true or false stops 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('main: a bad HB_MAX_OUTPUT_BYTES stops the service at start', async () => {
-  for (const value of ['0', '-1', '1.5', '8MiB', '']) {
-    const r = spawnSync(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { encoding: 'utf8', timeout: 30e3,
-      env: { PATH: process.env.PATH, HB_MAX_OUTPUT_BYTES: value, HB_CLIENTS: '/nonexistent/clients.json' } });
-    assert.notEqual(r.status, 0, value);
-    assert.match(r.stderr, /HB_MAX_OUTPUT_BYTES must be a positive integer/, value);
+test('main: a bad HB_MAX_OUTPUT_BYTES, HB_MAX_BODY, HB_MAX_JOBS or HB_MAX_QUICK stops the service at start', async () => {
+  for (const name of ['HB_MAX_OUTPUT_BYTES', 'HB_MAX_BODY', 'HB_MAX_JOBS', 'HB_MAX_QUICK']) {
+    for (const value of ['0', '-1', '1.5', '8MiB', '', ...(name === 'HB_MAX_BODY' ? [String(2 ** 29)] : name.includes('BYTES') ? [] : ['1001'])]) {
+      const r = spawnSync(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { encoding: 'utf8', timeout: 30e3,
+        env: { PATH: process.env.PATH, [name]: value, HB_CLIENTS: '/nonexistent/clients.json' } });
+      assert.notEqual(r.status, 0, `${name}=${value}`);
+      assert.match(r.stderr, new RegExp(`${name} must be a positive integer`), `${name}=${value}`);
+    }
   }
 });
 
@@ -354,7 +357,7 @@ test('service: file copies count against the file-count limit', BOX, async () =>
 const ROWS = [{ id: 'claude-code', name: 'Claude Code', version: '2.1.300', usable: true, why: null, webSearch: true },
   { id: 'codex', name: 'Codex', version: '0.162.1', usable: true, why: null, webSearch: true }, { id: 'grok', name: 'Grok', version: '1.0.52', usable: true, why: null, webSearch: false }];
 const FAKE_RESULT = { code: 0, text: 'done', usage: { input: 1, output: 2 }, error: '', stderr: '', why: null, timedOut: false, canceled: false };
-async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = '', result = {} } = {}) {
+async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = '', result = {}, hb: more = {} } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hb-fake-svc-')), runs = join(root, 'runs'), sock = join(root, 'hb.sock'), calls = [];
   mkdirSync(runs);
   const hb = {
@@ -362,10 +365,11 @@ async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = 
       calls.push({ scoped, h, ...o });
       o.onStart();
       for (const e of typeof events === 'function' ? events() : events) o.onEvent(e, { stage: '' });
-      if (output) writeFileSync(join(o.dir, 'out.txt'), output);
+      for (const [name, text] of Object.entries(typeof output === 'string' ? (output ? { 'out.txt': output } : {}) : output)) writeFileSync(join(o.dir, name), text);
       return { ...FAKE_RESULT, ...result };
     },
     exec: async () => ({ code: 0, out: '{}', why: null }),
+    ...more,
   };
   const svc = createService({ hb, harnesses, runs, limits,
     clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appc', tokenSha256: hex(TOKEN.c), webSearch: true, events: true }] });
@@ -611,20 +615,20 @@ test('service: a forgotten run lets go of its events, outputs and result, whethe
   const events = Array.from({ length: 30 }, (_, i) => ({ type: 'text', data: `${i}`.padEnd(90, '.') }));
   // outputs are read through /proc (readOutBytes): on Linux out.txt comes back, elsewhere it is null; either way it is dropped
   const linux = process.platform === 'linux';
-  let w = await fakeWorld({ events, limits: { keptBytes: 8000 }, output: 'o'.repeat(3000) });
+  let w = await fakeWorld({ events, limits: { keptBytes: 8000 }, output: 'o'.repeat(2400) });
   try {
     const run = async () => { const id = (await w.c.run({ user: 'u1', harness: 'codex', prompt: 'x', events: true, outputs: ['out.txt'] })).id; await w.c.events(id); return id; };
     const first = await run(), a = w.map.get(first);
     for (let i = 0; i < 50 && !a.timer; i++) await sleep(20); // the end's bookkeeping follows the end event
     assert.ok(a.kept && a.result && 'out.txt' in a.outputs && a.timer, 'an ended run holds its fields until it is forgotten');
-    if (linux) assert.equal(Buffer.from(a.outputs['out.txt'], 'base64').length, 3000);
+    if (linux) assert.equal(Buffer.from(a.outputs['out.txt'], 'base64').length, 2400);
     const second = await run(), b = w.map.get(second);
     for (let i = 0; i < 50 && w.map.has(first); i++) await sleep(20);
-    assert.ok(!w.map.has(first), 'two runs of 4410 bytes of events (and 3000 of output on Linux) pass 8000: the first goes');
+    assert.ok(!w.map.has(first), 'two runs of 4410 bytes of events (and 2400 of output on Linux, 3200 as base64) pass 8000: the first goes');
     assert.deepEqual([a.kept, a.result, a.outputs, a.validator, a.timer, a.bytes], [null, null, null, null, null, 0], 'and holds nothing large any more');
     for (let i = 0; i < 50 && !b.timer; i++) await sleep(20);
     assert.ok(b.kept && b.result && 'out.txt' in b.outputs && b.timer, 'the run that stays keeps everything');
-    if (linux) assert.equal(Buffer.from(b.outputs['out.txt'], 'base64').length, 3000);
+    if (linux) assert.equal(Buffer.from(b.outputs['out.txt'], 'base64').length, 2400);
     assert.equal((await w.c.getRun(second)).result.events.length, 30);
   } finally { w.close(); }
   w = await fakeWorld({ events, limits: { keptRuns: 1 }, output: 'o' });
@@ -741,4 +745,255 @@ test('service: event and item types that are Object.prototype keys or end in hal
     // a harness id that is an Object.prototype key, with no models configured: any well-formed model, not a 500
     assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'toString', prompt: 'x', model: 'm1' })).id)).state, 'done');
   } finally { w.close(); }
+});
+
+test('service: outputs past outputsBytes are null without using up the room, and an output named __proto__ is kept', async () => {
+  const w = await fakeWorld({ limits: { outputsBytes: 2000 }, output: { a: 'a'.repeat(1500), b: 'b'.repeat(1000), c: 'c'.repeat(10), ['__proto__']: 'p' } });
+  try {
+    const r = await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', outputs: ['a', 'b', 'c', '__proto__'] })).id);
+    assert.deepEqual(Object.entries(r.outputs).map(([k, v]) => [k, unb64(v)?.length ?? null]), [['a', 1500], ['b', null], ['c', 10], ['__proto__', 1]]);
+    assert.equal(w.map.get(r.id).bytes, Math.ceil(1511 / 3) * 4 + Buffer.byteLength(FAKE_RESULT.text), 'held outputs at their base64 size');
+  } finally { w.close(); }
+});
+
+test('service: a request URL that does not parse is a 400; events() on an unknown run rejects with the service\'s code', async () => {
+  const w = await fakeWorld();
+  try {
+    const r = await raw(w.sock, 'GET', 'http://[x/v1/harnesses', { authorization: `Bearer ${TOKEN.a}` });
+    assert.equal(r.status, 400);
+    assert.equal(JSON.parse(r.body).error.code, 'bad_request');
+    await assert.rejects(w.a.events('run_nope'), (e) => e instanceof HarnessboxError && e.status === 404 && e.code === 'unknown_run');
+  } finally { w.close(); }
+});
+
+test('service: a login started while a purge waits for the locks stays visible, counted and cancelable; expiresAt is the runner\'s', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-purge-svc-')), sock = join(root, 'hb.sock'), made = [];
+  let letPurge;
+  const hb = {
+    // a stand-in for the runner's session: its box (and its 10 minutes) and URL after 300 ms; the runner's purge cancels the user's
+    // logins first, then waits
+    login: (scoped) => {
+      let ok, end;
+      const s = { scoped, state: 'starting', url: null, code: null, needsCode: false, expiresAt: null, submitCode: () => false, waiting: new Promise((r) => { ok = r; }), done: new Promise((r) => { end = r; }),
+        cancel() { if (s.state === 'starting' || s.state === 'waiting') { s.state = 'failed'; s.error = 'canceled'; end({ ok: false, error: 'canceled' }); } } };
+      setTimeout(() => { if (s.state === 'starting') { Object.assign(s, { state: 'waiting', url: 'https://claude.ai/oauth', expiresAt: Date.now() + 10 * 60e3 }); ok({}); } }, 300);
+      made.push(s);
+      return s;
+    },
+    purge: (scoped) => { for (const s of made) if (s.scoped === scoped) s.cancel(); return new Promise((r) => { letPurge = r; }); },
+  };
+  const svc = createService({ hb, harnesses: ROWS, runs: root, limits: { logins: 1 }, clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }] });
+  await new Promise((r) => svc.server.listen(sock, r));
+  const a = harnessbox({ socketPath: sock, token: TOKEN.a });
+  try {
+    const before = await a.login('u1', 'codex');
+    assert.equal(before.state, 'waiting');
+    assert.equal(Date.parse(before.expiresAt), made[0].expiresAt, 'the runner\'s deadline, which began with its box');
+    assert.ok(Date.parse(before.expiresAt) - Date.parse(before.startedAt) >= 10 * 60e3 + 250, 'not counted from the request');
+    const purge = a.purge('u1');
+    await sleep(100);
+    assert.equal((await a.login('u1', 'claude-code')).state, 'waiting');
+    letPurge();
+    await purge;
+    await assert.rejects(a.loginState('u1', 'codex'), { status: 404, code: 'no_login' });
+    assert.equal((await a.loginState('u1', 'claude-code')).state, 'waiting');
+    await assert.rejects(a.login('u2', 'claude-code'), { status: 429, code: 'too_many_logins' });
+    await a.cancelLogin('u1', 'claude-code');
+  } finally { svc.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('service: answer bytes a client has not read are capped: a 429 for GET, an event stream closed, POST still answers; one answer always goes; inflight is at least the body cap', async () => {
+  // answers of 1.4 MiB (a 1 MiB output as base64), past both the 1 MiB cap and what the kernel's socket buffers take
+  const w = await fakeWorld({ limits: { answerBytes: 2 ** 20, body: 3000, inflightBytes: 100 }, output: 'o'.repeat(2 ** 20) });
+  try {
+    const run = await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x'.repeat(2500), outputs: ['out.txt'] })).id); // a body past inflightBytes
+    assert.equal(run.state, 'done');
+    assert.equal((await w.a.getRun(run.id)).id, run.id, 'nothing owed: an answer past the cap still goes');
+    // a socket that asks and never reads: its answer waits in the service
+    const stuck = net.connect(w.sock);
+    stuck.write(`GET /v1/runs/${run.id} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${TOKEN.a}\r\n\r\n`);
+    stuck.pause();
+    await sleep(200);
+    await assert.rejects(w.a.getRun(run.id), { status: 429, code: 'too_many_answers' });
+    await assert.rejects(w.a.events(run.id), (e) => e instanceof HarnessboxError && e.code === 'stream_ended', 'the end event does not fit: the stream closes');
+    const started = w.calls.length;
+    assert.equal((await w.a.run({ user: 'u2', harness: 'claude-code', prompt: 'y' })).state !== undefined, true, 'POST answers with the run it started');
+    assert.equal(w.calls.length, started + 1);
+    stuck.destroy();
+    await sleep(100);
+    assert.equal((await w.a.getRun(run.id)).id, run.id, 'read (or gone), the bytes are paid back');
+  } finally { w.close(); }
+  // clients gone while their runs' files were still being written: their answers are never written, so never owed
+  const w2 = await fakeWorld({ limits: { answerBytes: 2 ** 20 }, output: 'o'.repeat(2 ** 20) });
+  try {
+    const run = await w2.a.events((await w2.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', outputs: ['out.txt'] })).id);
+    for (let i = 0; i < 3; i++) {
+      const files = Array.from({ length: 1500 }, (_, n) => ({ path: `f${n}`, text: 'x' }));
+      const data = JSON.stringify({ user: 'u3', harness: 'claude-code', prompt: 'z', files });
+      const s = net.connect(w2.sock);
+      s.on('error', () => {});
+      s.write(`POST /v1/runs HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${TOKEN.a}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(data)}\r\n\r\n${data}`);
+      const before = w2.map.size;
+      while (w2.map.size === before) await new Promise(setImmediate); // admitted: its files are being written now
+      s.destroy();
+      await sleep(500);
+    }
+    assert.equal(w2.map.size, 4, 'the three runs were made');
+    assert.equal((await w2.a.getRun(run.id)).id, run.id, 'nothing owed for answers that were never written');
+  } finally { w2.close(); }
+});
+
+test('service: a run tmpfs with no room is a 507 no_space and leaves no folder; a path clash is still a 400', { skip: spawnSync('unshare', ['-rm', 'true']).status !== 0 && 'needs unshare -rm' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-nospace-')), runs = join(root, 'runs');
+  mkdirSync(runs);
+  // in a mount namespace of its own: runs/ is a 256 KiB tmpfs; a fake runner, a 1 MiB file
+  const script = `
+    import { createService } from ${JSON.stringify(join(HERE, '..', 'src', 'server.mjs'))};
+    import { harnessbox } from ${JSON.stringify(join(HERE, '..', 'src', 'client.mjs'))};
+    import { createHash } from 'node:crypto';
+    import { readdirSync } from 'node:fs';
+    const runs = ${JSON.stringify(runs)}, sock = ${JSON.stringify(join(root, 'hb.sock'))}, token = 'token-of-client-a-0123456789';
+    const svc = createService({ hb: { run: async () => ({}) }, runs, harnesses: [{ id: 'claude-code', name: 'Claude Code', version: '2.1.300', usable: true, why: null }],
+      clients: [{ id: 'appa', tokenSha256: createHash('sha256').update(token).digest('hex') }] });
+    await new Promise((r) => svc.server.listen(sock, r));
+    const a = harnessbox({ socketPath: sock, token }), out = [];
+    for (const files of [[{ path: 'big', text: 'x'.repeat(2 ** 20) }], [{ path: 'a', text: 'x' }, { path: 'a/b', text: 'y' }]]) {
+      await a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', files }).then(() => out.push('ok'), (e) => out.push(e.status + ' ' + e.code));
+    }
+    out.push(readdirSync(runs).length);
+    console.log(JSON.stringify(out));
+    svc.close();`;
+  try {
+    const r = spawnSync('unshare', ['-rm', 'sh', '-c', `mount -t tmpfs -o size=256k none "$1" && exec "$2" --input-type=module -e "$3"`, 'sh', runs, process.execPath, script], { encoding: 'utf8', timeout: 30e3 });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout.trim().split('\n').at(-1)), ['507 no_space', '400 bad_files', 0]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('service: a status or logout box that failed is a 503 status_failed with its reason; busy stays a 409', async () => {
+  let fail = new Error('the status check did not finish in time');
+  const w = await fakeWorld({ hb: { status: async () => { throw fail; }, logout: async () => { throw fail; } } });
+  try {
+    await assert.rejects(w.a.status('u1', 'claude-code'), { status: 503, code: 'status_failed', message: 'the status check did not finish in time' });
+    await assert.rejects(w.a.logout('u1', 'claude-code'), { status: 503, code: 'status_failed' });
+    fail = new Busy('busy');
+    await assert.rejects(w.a.logout('u1', 'claude-code'), { status: 409, code: 'busy' });
+  } finally { w.close(); }
+});
+
+test('service: path segments are counted in bytes: a Korean file name past 255 bytes is a 400, one at 255 bytes is written', async () => {
+  const w = await fakeWorld({ output: { ['사'.repeat(85)]: 'ok' } }); // 255 bytes
+  try {
+    const long = `materials/${'사진'.repeat(45)}.jpg`; // 274 bytes in its last segment
+    await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: long, text: 'x' }] }), { status: 400, code: 'bad_files' });
+    await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', outputs: [`out/${'사진'.repeat(45)}/x`] }), { status: 400, code: 'bad_path' });
+    await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', readonly: ['사'.repeat(86)] }), { status: 400, code: 'bad_path' });
+    const r = await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', files: [{ path: `in/${'사'.repeat(85)}`, text: 'x' }], outputs: ['사'.repeat(85)] })).id);
+    assert.equal(unb64(r.outputs['사'.repeat(85)]), 'ok');
+  } finally { w.close(); }
+});
+
+test('service: a readonly folder given twice is a 400; a client entry whose harnesses is not an array of ids stops the service', async () => {
+  const w = await fakeWorld();
+  try {
+    await assert.rejects(w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', readonly: ['skill', 'skill'] }), { status: 400, code: 'bad_path' });
+    assert.equal((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', readonly: ['skill', 'other'] })).harness, 'claude-code');
+  } finally { w.close(); }
+  for (const harnesses of ['codex', [1], null]) {
+    assert.throws(() => createService({ hb: {}, harnesses: ROWS, runs: '/nonexistent', clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a), harnesses }] }), /harnesses must be an array of ids/, JSON.stringify(harnesses));
+  }
+});
+
+test('service: an ended run\'s folder goes even when the box made folders in it 0555 or 000', async () => {
+  const w = await fakeWorld({ hb: { run: async (scoped, h, o) => {
+    o.onStart();
+    mkdirSync(join(o.dir, 'd', 'e'), { recursive: true });
+    writeFileSync(join(o.dir, 'd', 'e', 'big'), 'x'.repeat(1000));
+    mkdirSync(join(o.dir, 'z'));
+    chmodSync(join(o.dir, 'd', 'e'), 0o555);
+    chmodSync(join(o.dir, 'd'), 0o555);
+    chmodSync(join(o.dir, 'z'), 0o000);
+    return { ...FAKE_RESULT };
+  } } });
+  try {
+    for (let i = 0; i < 2; i++) assert.equal((await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x' })).id)).state, 'done');
+    await sleep(100);
+    assert.deepEqual(readdirSync(w.runs), []);
+  } finally { w.close(); }
+});
+
+test('client: a url that is not http: is refused; an IPv6 url reaches the service', async (t) => {
+  assert.throws(() => harnessbox({ url: 'https://127.0.0.1:8740', token: 'x'.repeat(20) }), /plain HTTP/);
+  const srv = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ harnesses: [], auth: req.headers.authorization })); });
+  try { await new Promise((ok, fail) => { srv.once('error', fail); srv.listen(0, '::1', ok); }); } catch { return t.skip('no IPv6 loopback'); }
+  try {
+    const r = await harnessbox({ url: `http://[::1]:${srv.address().port}`, token: 'token-0123456789abcdef' }).harnesses();
+    assert.equal(r.auth, 'Bearer token-0123456789abcdef');
+  } finally { srv.close(); }
+});
+
+test('main: an unknown HB_HARNESSES id stops the service at start; spaces around the commas are fine', () => {
+  for (const [value, bad] of [['claude-code, Codex', 'Codex'], ['claude-code,,codex', '']]) {
+    const r = spawnSync(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { encoding: 'utf8', timeout: 30e3, env: { PATH: process.env.PATH, HB_HARNESSES: value, HB_CLIENTS: '/nonexistent/clients.json' } });
+    assert.notEqual(r.status, 0);
+    assert.ok(r.stderr.includes(`HB_HARNESSES: no harness ${JSON.stringify(bad)}`), r.stderr);
+  }
+  const ok = spawnSync(process.execPath, [join(HERE, '..', 'src', 'server.mjs')], { encoding: 'utf8', timeout: 30e3, env: { PATH: process.env.PATH, HB_HARNESSES: 'claude-code, codex', HB_CLIENTS: '/nonexistent/clients.json' } });
+  assert.ok(!ok.stderr.includes('HB_HARNESSES') && ok.stderr.includes('/nonexistent/clients.json'), 'past the harness check, to the clients file');
+});
+
+test('main: HB_LISTEN is host:port or [v6]:port for TCP, anything else a socket path', () => {
+  assert.deepEqual(listenOf('0.0.0.0:8740'), { host: '0.0.0.0', port: 8740 });
+  assert.deepEqual(listenOf('harnessbox:8740'), { host: 'harnessbox', port: 8740 });
+  assert.deepEqual(listenOf('[::1]:8740'), { host: '::1', port: 8740 });
+  assert.deepEqual(listenOf('[::]:8740'), { host: '::', port: 8740 });
+  for (const p of ['/run/harnessbox/hb.sock', '[::1]', 'relative.sock', '/a:1']) assert.deepEqual(listenOf(p), { path: p });
+});
+
+test('client: neither socketPath nor url is refused (node:http would send the token to localhost:80)', () => {
+  for (const o of [{}, { socketPath: undefined }, { url: '' }]) assert.throws(() => harnessbox({ ...o, token: 'x'.repeat(20) }), /socketPath or url is required/);
+});
+
+test('service: an ended run whose validator failed still counts its text and stderr against keptBytes', async () => {
+  const w = await fakeWorld({ limits: { keptBytes: 6000 }, result: { text: 'x'.repeat(3000), stderr: 'e'.repeat(1000) }, hb: { exec: async () => { throw new Error('validator box failed'); } } });
+  try {
+    const job = () => w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', validate: { argv: ['true'] } });
+    const first = await w.a.events((await job()).id);
+    assert.equal(first.state, 'failed');
+    for (let i = 0; i < 50 && w.map.get(first.id)?.bytes === undefined; i++) await sleep(20); // the end's bookkeeping follows the end event
+    assert.equal(w.map.get(first.id).bytes, 4000);
+    await w.a.events((await job()).id);
+    for (let i = 0; i < 50 && w.map.has(first.id); i++) await sleep(20);
+    await assert.rejects(w.a.getRun(first.id), { status: 404, code: 'unknown_run' }, 'two runs of 4000 pass 6000: the first goes');
+  } finally { w.close(); }
+});
+
+test('service: a run canceled while its validator waits for a slot ends canceled like any cancel: no error, outputs read', async () => {
+  let waiting;
+  const w = await fakeWorld({ output: 'draft', hb: { exec: (u, h, argv, o) => new Promise((_, no) => { waiting = true; o.signal.addEventListener('abort', () => no(o.signal.reason)); }) } });
+  try {
+    const { id } = await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', outputs: ['out.txt'], validate: { argv: ['true'] } });
+    for (let i = 0; i < 50 && !waiting; i++) await sleep(20);
+    assert.equal((await w.a.getRun(id)).state, 'validating');
+    await w.a.cancelRun(id);
+    const r = await w.a.events(id);
+    assert.equal(r.state, 'canceled');
+    assert.equal(r.error, undefined);
+    assert.equal(r.validator, null);
+    assert.equal(unb64(r.outputs['out.txt']), 'draft');
+  } finally { w.close(); }
+});
+
+test('service: a validator box that bwrap could not set up is the run\'s error, as a spawn with no process is; never the validator\'s answer', async () => {
+  for (const exec of [async () => ({ code: 1, out: 'bwrap: Creating new namespace failed\n', why: 'the box did not start' }), async () => { throw new Error('the box did not start (spawn failed)'); }]) {
+    const w = await fakeWorld({ output: 'draft', hb: { exec } });
+    try {
+      const r = await w.a.events((await w.a.run({ user: 'u1', harness: 'claude-code', prompt: 'x', outputs: ['out.txt'], validate: { argv: ['true'] } })).id);
+      assert.equal(r.state, 'failed');
+      assert.match(r.error, /box did not start/);
+      assert.equal(r.result.code, 0, 'the CLI\'s own result');
+      assert.equal(r.validator, null);
+      assert.equal(r.outputs, null);
+    } finally { w.close(); }
+  }
 });
