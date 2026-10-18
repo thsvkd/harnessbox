@@ -9,7 +9,7 @@ Use it as a library in your own runner process (below), or run it as a **service
 each app with its own token and its own users (`node src/server.mjs`, the image's default command; [docs/service.md](docs/service.md)).
 
 Extracted on 2026-10-16 from review-automation's per-user runner (`app/runner/box.mjs`, `rva-runner.mjs`), deployed there for
-Claude Code and Codex. Node 24.2 or later (`import.meta.main`), Linux (arm64 or x64), bubblewrap, socat; no runtime npm dependencies. Version 0.4.0.
+Claude Code and Codex. Node 24.2 or later (`import.meta.main`), Linux (arm64 or x64), bubblewrap, socat; no runtime npm dependencies. Version 0.5.0.
 Install the package tarball from this repository's release, or use a Git dependency. TypeScript declarations and the deployment
 probe are included. The package is not published to the public npm registry.
 TypeScript consumers need `@types/node` in their development dependencies.

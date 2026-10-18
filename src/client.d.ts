@@ -33,6 +33,8 @@ export interface Run {
   outputs?: Record<string, string | null> | null;
 }
 export interface Harnessbox {
+  /** The client this service hands out (autoUpdate takes it): its version, the oldest client the service takes, its source and signature. */
+  client(): Promise<{ version: string; minClient: string; source: string; signature: string }>;
   /** webSearch: the harness's adapter supports webSearch (whether this client may use it is its entry's webSearch). */
   harnesses(): Promise<{ harnesses: { id: string; name: string; version: string | null; usable: boolean; why: string | null; webSearch: boolean }[] }>;
   statuses(user: string): Promise<{ harnesses: HarnessStatus[] }>;
@@ -48,4 +50,11 @@ export interface Harnessbox {
   cancelRun(id: string): Promise<null>;
   events(id: string, onEvent?: (event: 'state' | 'progress' | 'end', run: Run) => void): Promise<Run>;
 }
-export function harnessbox(options: { socketPath?: string; url?: string; token: string }): Harnessbox;
+/** This client's version: the harnessbox release its code last changed in; sent with every request (harnessbox-client). */
+export const VERSION: string;
+/** a is older than b (x.y.z versions) */
+export function older(a: string, b: string): boolean;
+/** autoUpdate (default true): on a 426 client_too_old, load the client the service hands out (GET /v1/client) in memory and ask again,
+ *  when the harnessbox maintainers' key signed it and it is no older than this one or the service's minimum; else the call rejects
+ *  with 426 client_update_failed. */
+export function harnessbox(options: { socketPath?: string; url?: string; token: string; autoUpdate?: boolean }): Harnessbox;

@@ -5,15 +5,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, generateKeyPairSync, sign, verify } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Busy, claudeCode, codex, createRunner, grok } from '../src/index.mjs';
-import { harnessbox, HarnessboxError } from '../src/client.mjs';
-import { BOX_DIR, createService, listenOf } from '../src/server.mjs';
+import { harnessbox, HarnessboxError, older, VERSION as CLIENT_VERSION } from '../src/client.mjs';
+import { BOX_DIR, createService, listenOf, MIN_CLIENT, VERSION } from '../src/server.mjs';
 
 const HERE = import.meta.dirname;
 const FAKE = { 'claude-code': join(HERE, 'fake-claude'), codex: join(HERE, 'fake-codex'), grok: join(HERE, 'fake-grok') };
@@ -357,7 +357,7 @@ test('service: file copies count against the file-count limit', BOX, async () =>
 const ROWS = [{ id: 'claude-code', name: 'Claude Code', version: '2.1.300', usable: true, why: null, webSearch: true },
   { id: 'codex', name: 'Codex', version: '0.162.1', usable: true, why: null, webSearch: true }, { id: 'grok', name: 'Grok', version: '1.0.52', usable: true, why: null, webSearch: false }];
 const FAKE_RESULT = { code: 0, text: 'done', usage: { input: 1, output: 2 }, error: '', stderr: '', why: null, timedOut: false, canceled: false };
-async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = '', result = {}, hb: more = {} } = {}) {
+async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = '', result = {}, hb: more = {}, service = {} } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hb-fake-svc-')), runs = join(root, 'runs'), sock = join(root, 'hb.sock'), calls = [];
   mkdirSync(runs);
   const hb = {
@@ -371,7 +371,7 @@ async function fakeWorld({ events = [], limits = {}, harnesses = ROWS, output = 
     exec: async () => ({ code: 0, out: '{}', why: null }),
     ...more,
   };
-  const svc = createService({ hb, harnesses, runs, limits,
+  const svc = createService({ hb, harnesses, runs, limits, ...service,
     clients: [{ id: 'appa', tokenSha256: hex(TOKEN.a) }, { id: 'appc', tokenSha256: hex(TOKEN.c), webSearch: true, events: true }] });
   await new Promise((r) => svc.server.listen(sock, r));
   return { runs, sock, map: svc.runs, calls, a: harnessbox({ socketPath: sock, token: TOKEN.a }), c: harnessbox({ socketPath: sock, token: TOKEN.c }),
@@ -994,6 +994,136 @@ test('service: a validator box that bwrap could not set up is the run\'s error, 
       assert.equal(r.result.code, 0, 'the CLI\'s own result');
       assert.equal(r.validator, null);
       assert.equal(r.outputs, null);
+    } finally { w.close(); }
+  }
+});
+
+// ---- client versions: each released client (test/compat) against this service, and a client the service needs newer
+const COMPAT = join(HERE, 'compat'), CLIENT_SRC = readFileSync(join(HERE, '..', 'src', 'client.mjs'), 'utf8');
+const RELEASED = readdirSync(COMPAT).flatMap((f) => /^client-(\d+\.\d+\.\d+)\.mjs$/.exec(f)?.[1] ?? []).sort((x, y) => (older(x, y) ? -1 : 1));
+const KEY_IN = (src) => /Buffer\.from\('([A-Za-z0-9+/=]+)', 'base64'\), format: 'der'/.exec(src)?.[1];
+const loadClient = (src) => import(`data:text/javascript;base64,${Buffer.from(src).toString('base64')}`);
+
+test('client: src/client.mjs is the released client of its VERSION (test/compat), signed by the key it trusts; MIN_CLIENT has its copy', () => {
+  assert.equal(readFileSync(join(COMPAT, `client-${CLIENT_VERSION}.mjs`), 'utf8'), CLIENT_SRC, 'a changed client is a new VERSION, copied to test/compat');
+  assert.ok(!older(VERSION, CLIENT_VERSION), 'the client\'s VERSION is a release of this package, at most this one');
+  assert.ok(RELEASED.includes(MIN_CLIENT), 'the oldest client the service takes is tested');
+  const key = { key: Buffer.from(KEY_IN(CLIENT_SRC), 'base64'), format: 'der', type: 'spki' };
+  assert.ok(verify(null, Buffer.from(CLIENT_SRC), key, Buffer.from(readFileSync(join(HERE, '..', 'src', 'client.mjs.sig'), 'utf8'), 'base64')), 'npm run sign-client after changing the client');
+});
+
+test('compat: every released client from MIN_CLIENT on: harnesses, a login, a draft job with events and outputs, error codes, logout, purge', BOX, async () => {
+  const w = await world();
+  try {
+    // the ones before 0.5.0 send no version and count as 0.4.0: they run as long as the service takes 0.4.0
+    for (const v of RELEASED.filter((x) => !older(older(x, '0.5.0') ? '0.4.0' : x, MIN_CLIENT))) {
+      const hb = (await import(join(COMPAT, `client-${v}.mjs`))).harnessbox({ socketPath: w.sock, token: TOKEN.a }), user = `compat${v.replaceAll('.', '')}`;
+      assert.deepEqual((await hb.harnesses()).harnesses.map((h) => [h.id, h.usable]), [['claude-code', true], ['codex', true], ['grok', true]], v);
+      assert.equal((await hb.status(user, 'codex')).loggedIn, false, v);
+      let s = await hb.login(user, 'codex');
+      assert.deepEqual([s.state, s.code], ['waiting', 'FAKE-12345'], v);
+      for (let i = 0; i < 50 && (s = await hb.loginState(user, 'codex')).state !== 'done'; i++) await sleep(100);
+      assert.deepEqual([s.state, s.status?.loggedIn], ['done', true], v);
+      w.logIn('appa', user, 'claude-code');
+      const seen = [], r = await hb.events((await hb.run(draftJob(user, 'claude-code'))).id, (event) => seen.push(event));
+      assert.deepEqual([r.state, r.result.text, unb64(r.outputs['out/draft.md']), seen.at(-1)], ['done', 'done (rva)', '# draft\n', 'end'], v);
+      assert.deepEqual(Object.keys(r.result), RESULT_020, v);
+      assert.equal((await hb.getRun(r.id)).state, 'done', v);
+      await assert.rejects(hb.getRun('nope'), { status: 404, code: 'unknown_run' }, v);
+      assert.equal(await hb.cancelRun(r.id), null, v);
+      assert.equal((await hb.logout(user, 'codex')).loggedIn, false, v);
+      assert.equal(await hb.purge(user), null, v);
+      assert.ok(w.logs.includes(`client appa uses client ${older(v, '0.5.0') ? 'before 0.5.0' : v}`), v);
+    }
+  } finally { await w.close(); }
+});
+
+test('service: a client version that is not x.y.z is a 400, one under minClient a 426 but for GET /v1/client; every answer names the service\'s version', async () => {
+  const logs = [], w = await fakeWorld({ service: { minClient: '0.5.0', log: (l) => logs.push(l) } });
+  try {
+    const ask = (path, v) => raw(w.sock, 'GET', path, { authorization: `Bearer ${TOKEN.a}`, ...(v ? { 'harnessbox-client': v } : {}) });
+    assert.equal((await ask('/v1/harnesses', 'x')).status, 400);
+    assert.equal(JSON.parse((await ask('/v1/harnesses', '0.4.9')).body).error.code, 'client_too_old');
+    assert.equal((await ask('/v1/harnesses')).status, 426, 'one without the header is from before 0.5.0');
+    assert.equal((await ask('/v1/harnesses', '0.5.0')).status, 200);
+    const c = JSON.parse((await ask('/v1/client', '0.2.0')).body);
+    assert.deepEqual([c.version, c.minClient, c.source], [CLIENT_VERSION, '0.5.0', CLIENT_SRC]);
+    const res = await new Promise((done) => http.get({ socketPath: w.sock, path: '/nope' }, done));
+    assert.equal(res.headers['harnessbox-version'], VERSION);
+    await assert.rejects((await import(join(COMPAT, 'client-0.4.0.mjs'))).harnessbox({ socketPath: w.sock, token: TOKEN.a }).harnesses(), { status: 426, code: 'client_too_old' });
+    // each version logged once, at most 8 per client, then one line: a client sending many cannot hide another's
+    for (let i = 0; i < 12; i++) await ask('/v1/harnesses', `1.0.${i}`);
+    await raw(w.sock, 'GET', '/v1/harnesses', { authorization: `Bearer ${TOKEN.c}`, 'harnessbox-client': '0.5.0' });
+    const lines = logs.filter((l) => l.startsWith('client '));
+    assert.equal(lines.filter((l) => l.startsWith('client appa uses client ')).length, 8);
+    assert.equal(lines.filter((l) => l === 'client appa uses more client versions (not logged)').length, 1);
+    assert.ok(lines.includes('client appc uses client 0.5.0'));
+  } finally { w.close(); }
+});
+
+test('client: under the service\'s minimum it loads the signed client the service hands out and asks again; unsigned, tampered, older or still too old is refused', async () => {
+  const mine = generateKeyPairSync('ed25519'), theirs = generateKeyPairSync('ed25519');
+  const pub = mine.publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
+  const variant = (v) => CLIENT_SRC.replace(/export const VERSION = '[^']+'/, `export const VERSION = '${v}'`).replace(KEY_IN(CLIENT_SRC), pub);
+  const handOut = (v, { key = mine.privateKey, tamper = false } = {}) => ({ version: v, source: variant(v) + (tamper ? '\n// changed\n' : ''), signature: sign(null, Buffer.from(variant(v)), key).toString('base64') });
+  let n = 0; // a module of its own per case: what a process loaded is kept per module
+  const appCopy = () => loadClient(`${variant('0.5.0')}// copy ${n++}\n`); // the copy an app has, trusting the test key
+  const cases = [
+    [handOut('0.6.0'), null], [handOut('0.6.0', { tamper: true }), 'client_update_failed'], [handOut('0.6.0', { key: theirs.privateKey }), 'client_update_failed'],
+    [{ ...handOut('0.6.0'), signature: 'not base64 at all' }, 'client_update_failed'], [handOut('0.4.0'), 'client_update_failed'], [handOut('0.5.5'), 'client_update_failed'],
+  ];
+  for (const [handed, code] of cases) {
+    let downloads = 0;
+    const client = { ...handed, get source() { downloads++; return handed.source; } };
+    const logs = [], w = await fakeWorld({ service: { minClient: '0.6.0', client, log: (l) => logs.push(l) } }), app = await appCopy();
+    try {
+      const hb = app.harnessbox({ socketPath: w.sock, token: TOKEN.a });
+      if (code) { await assert.rejects(hb.harnesses(), { status: 426, code }, `${handed.version} ${code}`); continue; }
+      const all = await Promise.all([hb.harnesses(), hb.harnesses(), hb.harnesses(), hb.getRun('nope').catch((e) => e), hb.harnesses()]);
+      assert.equal(all[0].harnesses.length, 3);
+      assert.equal(downloads, 1, 'one download for calls at once');
+      assert.deepEqual(logs.filter((l) => l.startsWith('client ')), ['client appa uses client 0.5.0', 'client appa uses client 0.6.0']);
+      assert.ok(all[3] instanceof app.HarnessboxError && all[3] instanceof HarnessboxError && all[3].code === 'unknown_run', 'errors of the loaded copy are HarnessboxErrors of every copy');
+      assert.equal((await hb.harnesses()).harnesses.length, 3);
+      assert.equal((await app.harnessbox({ socketPath: w.sock, token: TOKEN.a }).harnesses()).harnesses.length, 3, 'a new client object starts from what the process loaded');
+      assert.equal(downloads, 1);
+      await assert.rejects(app.harnessbox({ socketPath: w.sock, token: TOKEN.a, autoUpdate: false }).harnesses(), { status: 426, code: 'client_too_old' }, 'autoUpdate: false is this copy only');
+    } finally { w.close(); }
+  }
+  // a service that lies (426 to every client, a minimum of 0.1.0): it cannot roll a copy back under itself or under what the process
+  // loaded, and an older signed client never runs, not even its top-level code
+  const root = mkdtempSync(join(tmpdir(), 'hb-liar-')), sock = join(root, 'hb.sock');
+  const side = (v) => { const h = handOut(v); const source = `${h.source}globalThis.hbRan = '${v}';\n`; return { ...h, source, signature: sign(null, Buffer.from(source), mine.privateKey).toString('base64') }; };
+  const queue = [side('0.4.0'), handOut('0.7.0'), side('0.6.0'), side('0.6.5')], app = await appCopy();
+  const liar = http.createServer((req, res) => {
+    const [status, body] = req.url === '/v1/client' ? [200, { ...queue.shift(), minClient: '0.1.0' }] : [426, { error: { code: 'client_too_old', message: 'x' } }];
+    res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+  });
+  await new Promise((r) => liar.listen(sock, r));
+  try {
+    const hb = app.harnessbox({ socketPath: sock, token: TOKEN.a });
+    await assert.rejects(hb.harnesses(), { status: 426, code: 'client_update_failed' }, '0.4.0 is older than the copy');
+    await assert.rejects(hb.harnesses(), { status: 426, code: 'client_too_old' }, '0.7.0 loaded; the liar still says 426');
+    await assert.rejects(hb.harnesses(), { status: 426, code: 'client_update_failed' }, '0.6.0 is older than the 0.7.0 loaded');
+    await assert.rejects(app.harnessbox({ socketPath: sock, token: TOKEN.a }).harnesses(), { status: 426, code: 'client_update_failed' }, 'and so for a new client object');
+    assert.equal(globalThis.hbRan, undefined, 'a refused client never ran');
+  } finally { liar.close(); rmSync(root, { recursive: true, force: true }); }
+  // the real thing: src/client.mjs and its .sig as the service hands them out, the maintainers' key in a copy that is behind
+  const real = await fakeWorld({ service: { minClient: CLIENT_VERSION } });
+  try {
+    const behind = await loadClient(CLIENT_SRC.replace(/export const VERSION = '[^']+'/, "export const VERSION = '0.4.9'"));
+    assert.equal((await behind.harnessbox({ socketPath: real.sock, token: TOKEN.a }).harnesses()).harnesses.length, 3, 'npm run sign-client');
+  } finally { real.close(); }
+  // each released copy that updates itself (0.5.0 on) takes today's client: its VERSION line, exports, /v1/client and error brand
+  const today = (v) => CLIENT_SRC.replace(/export const VERSION = '[^']+'/, `export const VERSION = '${v}'`).replace(KEY_IN(CLIENT_SRC), pub);
+  for (const v of RELEASED.filter((x) => !older(x, '0.5.0'))) {
+    const released = await loadClient(`${readFileSync(join(COMPAT, `client-${v}.mjs`), 'utf8').replace(KEY_IN(CLIENT_SRC), pub)}// released ${v}\n`);
+    const source = today('99.0.0'), w = await fakeWorld({ service: { minClient: '99.0.0', client: { version: '99.0.0', source, signature: sign(null, Buffer.from(source), mine.privateKey).toString('base64') } } });
+    try {
+      const hb = released.harnessbox({ socketPath: w.sock, token: TOKEN.a });
+      assert.equal((await hb.harnesses()).harnesses.length, 3, v);
+      const e = await hb.getRun('nope').catch((x) => x);
+      assert.ok(e instanceof released.HarnessboxError && e.code === 'unknown_run', v);
     } finally { w.close(); }
   }
 });

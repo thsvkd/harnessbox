@@ -5,12 +5,15 @@
 // sessions are in memory; after a restart an unknown id is a 404 and the client asks again. docs/service.md is the API reference.
 // Nothing here logs or keeps a URL, code, token, prompt or output: only ids, states and the runner's egress denials.
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { dirname, join } from 'node:path';
 import { claudeCode, clip, codex, grok } from './adapters.mjs';
 import { ID, readOutBytes, rmTree } from './box.mjs';
+import { VERSION as CLIENT_VERSION, older } from './client.mjs';
 import { Busy, createRunner } from './runner.mjs';
+import pkg from '../package.json' with { type: 'json' };
 
 /** Where every run's folder appears inside its box: prompts, files and tool rules can name /work/... before the run exists. */
 export const BOX_DIR = '/work';
@@ -18,6 +21,13 @@ export const LIMITS = {
   body: 64 * 2 ** 20, prompt: 256 * 1024, files: 2000, filesBytes: 48 * 2 ** 20, outputs: 32, output: 2 * 2 ** 20, outputsBytes: 16 * 2 ** 20,
   eventsBytes: 2 ** 20, eventBytes: 64 * 1024, eventDepth: 64, eventsCount: 2000, activeRuns: 16, keptRuns: 200, keptBytes: 256 * 2 ** 20, inflightBytes: 128 * 2 ** 20, answerBytes: 128 * 2 ** 20, streams: 32, logins: 4, runTimeoutMs: 2 * 3600e3, validateMs: 10 * 60e3, keepMs: 30 * 60e3, statusFreshMs: 30e3, readyMs: 30e3,
 };
+/** This service's version, in every answer's harnessbox-version header. */
+export const VERSION = pkg.version;
+/** The oldest client this service takes (an older one gets 426 client_too_old): raise it only for a change older clients cannot
+ *  take, keeping the client's functions as they are (anything else is /v2). test/compat runs each released client from it on.
+ *  Clients before 0.5.0 send no version and count as 0.4.0: a minimum over 0.2.0 and under 0.5.0 would refuse none of them. */
+export const MIN_CLIENT = '0.2.0';
+const SEMVER = /^\d{1,4}\.\d{1,4}\.\d{1,4}$/;
 const CODE = /^[\x21-\x7e]{1,2048}$/, MODEL = /^[A-Za-z0-9._:@/-]{1,100}$/;
 const ACTIVE = new Set(['queued', 'running', 'validating']);
 
@@ -46,8 +56,11 @@ const jsonObject = (v) => { try { const j = JSON.parse(v.trim()); return j !== n
  * @param {string} o.runs  folder for the run folders (a tmpfs); emptied by main() at start
  * @param {Record<string, string[]>} [o.models]  allowed models per harness id (absent: any well-formed name)
  * @param {Partial<typeof LIMITS>} [o.limits]
+ * @param {string} [o.minClient]  default MIN_CLIENT
+ * @param {{version: string, source: string, signature: string}} [o.client]  what GET /v1/client hands out: default src/client.mjs and its .sig
  */
-export function createService({ hb, harnesses, clients, runs: runsDir, models = {}, limits = {}, log = () => {} }) {
+export function createService({ hb, harnesses, clients, runs: runsDir, models = {}, limits = {}, log = () => {}, minClient = MIN_CLIENT,
+  client = { version: CLIENT_VERSION, source: readFileSync(new URL('./client.mjs', import.meta.url), 'utf8'), signature: readFileSync(new URL('./client.mjs.sig', import.meta.url), 'utf8').trim() } }) {
   const L = { ...LIMITS, ...limits };
   if (limits.body && !limits.filesBytes) L.filesBytes = Math.floor(limits.body * 0.75); // base64 in JSON
   L.inflightBytes = Math.max(L.inflightBytes, L.body); // else a body that size is a 429
@@ -391,10 +404,25 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
     req.on('error', (e) => stop(e));
   });
   // a status or logout box that failed (out of time, its CLI's check broke) is the CLI's answer missing, not the service's error
+  const versions = new Map(); // client -> the client versions logged for it, at most 8 (one client cannot hide another's)
+  /** the client's version (none: one from before 0.5.0, which sent none), logged once per client and version; 426 under minClient */
+  const clientVersion = (c, req, gettingClient) => {
+    const sent = req.headers['harnessbox-client'], v = sent ?? '0.4.0';
+    if (!SEMVER.test(v)) no(400, 'bad_client_version', 'harnessbox-client: x.y.z');
+    const seen = versions.get(c.id) ?? versions.set(c.id, new Set()).get(c.id);
+    if (!seen.has(v) && seen.size <= 8) {
+      seen.add(v);
+      log(seen.size > 8 ? `client ${c.id} uses more client versions (not logged)` : `client ${c.id} uses client ${sent ?? 'before 0.5.0'}`);
+    }
+    if (older(v, minClient) && !gettingClient) no(426, 'client_too_old', `this service (${VERSION}) needs a harnessbox client ${minClient} or later; this one is ${v}`);
+  };
   const checked = (p) => p.catch((e) => { if (e instanceof Busy || e instanceof HttpError) throw e; no(503, 'status_failed', String(e.message).slice(0, 200)); });
   async function route(req, res) {
     const c = auth(req), url = URL.parse(req.url, 'http://x') ?? no(400, 'bad_request', 'bad path'), m = req.method, p = url.pathname.split('/').slice(1).map(decodeURIComponent);
     if (p[0] !== 'v1') no(404, 'not_found', 'not found');
+    const gettingClient = m === 'GET' && p.length === 2 && p[1] === 'client';
+    clientVersion(c, req, gettingClient);
+    if (gettingClient) return json(res, 200, { version: client.version, minClient, source: client.source, signature: client.signature });
     if (m === 'GET' && p.length === 2 && p[1] === 'harnesses') return json(res, 200, { harnesses: allowed(c).map(({ id, name, version, usable, why, webSearch }) => ({ id, name, version, usable, why, webSearch: webSearch === true })) });
     if (p[1] === 'users' && p.length >= 3) {
       const scoped = userOf(c, p[2]);
@@ -454,6 +482,7 @@ export function createService({ hb, harnesses, clients, runs: runsDir, models = 
   }
   // the timeouts below are checked every connectionsCheckingInterval (Node's default 30 s): each second, so 10 s means 10-11 s
   const server = http.createServer({ connectionsCheckingInterval: 1000 }, (req, res) => {
+    res.setHeader('harnessbox-version', VERSION);
     route(req, res).catch((e) => {
       const err = e instanceof HttpError ? e : e instanceof Busy ? new HttpError(409, 'busy', 'this user\'s harness is busy (a login or a run); ask again later')
         : e instanceof URIError ? new HttpError(400, 'bad_request', 'bad path') : new HttpError(500, 'internal', 'internal error');
