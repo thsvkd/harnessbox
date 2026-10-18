@@ -1,6 +1,6 @@
 {
   "name": "harnessbox",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Per-user bubblewrap boxes for agent CLIs (Claude Code, Codex, Grok): each user's own login, an egress allowlist, no credential in the host app",
   "type": "module",
   "types": "./src/index.d.ts",
@@ -21,7 +21,7 @@
     "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=24"
+    "node": ">=24.2"
   },
   "os": [
     "linux"

@@ -10,31 +10,32 @@ with the same user ids. `src/client.mjs` is a dependency-free client: import it 
 
 | Variable | Default | |
 |---|---|---|
-| `HB_LISTEN` | `/run/harnessbox/hb.sock` | A unix socket path (made 0666; its folder is the boundary), or `host:port` for TCP on a private network. A socket path must stay under 108 bytes. |
-| `HB_CLIENTS` | `/etc/harnessbox/clients.json` | `{"clients":[{"id":"myapp","tokenSha256":"<hex>","harnesses":["claude-code"]}]}`. `harnesses` is optional (default: all). `"webSearch": true` and `"events": true` (default false) let that client's runs ask for them (below); a value that is not `true` or `false` stops the service at start. Read at start; restart to rotate. Make a token with `openssl rand -base64 32`, its hash with `printf %s "$TOKEN" \| sha256sum`. |
+| `HB_LISTEN` | `/run/harnessbox/hb.sock` | A unix socket path (made 0666; its folder is the boundary), or `host:port` (`[v6]:port`) for plain-HTTP TCP on a private network (the client refuses an `https:` URL: it would send the token in clear). A socket path must stay under 108 bytes. |
+| `HB_CLIENTS` | `/etc/harnessbox/clients.json` | `{"clients":[{"id":"myapp","tokenSha256":"<hex>","harnesses":["claude-code"]}]}`. `harnesses` is optional (default: all). `"webSearch": true` and `"events": true` (default false) let that client's runs ask for them (below); a value that is not `true` or `false` stops the service at start. Read at start; restart to rotate. Under `/etc` or `/usr` (which every box sees read-only) the boxes cannot read it; it must then be a regular file (a single-file bind mount; with Kubernetes a `subPath`), not a link that a secret volume swaps. Make a token with `openssl rand -base64 32`, its hash with `printf %s "$TOKEN" \| sha256sum`. |
 | `HB_HOMES` | `/homes` | Users' homes. |
 | `HB_RUNS` | `/tmp/hb-runs` | Run folders (put it on a tmpfs). Emptied at start. |
-| `HB_HARNESSES` | `claude-code,codex,grok` | Which adapters to load. |
+| `HB_HARNESSES` | `claude-code,codex,grok` | Which adapters to load (spaces around the commas are fine); an unknown id stops the service at start. |
 | `HB_BIN_<ID>`, `HB_PIN_<ID>` | on PATH, none | Binary and exact version per harness (`HB_BIN_CLAUDE_CODE`, `HB_PIN_CODEX`, …). A CLI of another version is not usable. |
-| `HB_MODELS_<ID>` | any | Comma list of allowed `model` values for that harness. |
-| `HB_MAX_JOBS` | 3 | CLI runs at once, all clients together. More wait (queued). |
-| `HB_MAX_QUICK` | 4 | Status and logout boxes at once. |
+| `HB_MODELS_<ID>` | any | Comma list of allowed `model` values for that harness (each trimmed). |
+| `HB_MAX_JOBS` | 3 | CLI runs at once, all clients together, and validators the same (a validator waits for a slot too). More wait (queued). A positive integer up to 1000, else the service does not start. |
+| `HB_MAX_QUICK` | 4 | Status and logout boxes at once. A positive integer up to 1000, else the service does not start. |
 | `HB_MAX_OUTPUT_BYTES` | 8 MiB | A run's CLI stdout and stderr together; past it the box is stopped (`result.why`). Claude Code's stream-json carries every image it reads, so raise it for jobs with many photos. A positive integer, else the service does not start. |
-| `HB_MAX_BODY` | 64 MiB | Request body cap; the decoded files of a run may take three quarters of it. Size the container's `/tmp` tmpfs for `HB_MAX_JOBS` runs of that. |
+| `HB_MAX_BODY` | 64 MiB | Request body cap in bytes (a positive integer up to 2^29 - 24, the longest string V8 parses, else the service does not start); the decoded files of a run may take three quarters of it, and the per-client bytes in flight are at least this. A run's files are written when it is accepted and stay until it ends, queued or not: size the container's `/tmp` tmpfs for every client's 16 active runs of that, or less if your clients send less. |
 | `HB_BWRAP`, `HB_SOCAT` | on PATH | |
 
 Fixed limits (`LIMITS` in `src/server.mjs`): prompt 256 KiB; 2000 files, 48 MiB decoded; 32 outputs, 2 MiB each, 16 MiB together;
-16 active runs and 200 kept runs per client; 256 MiB of ended runs' outputs for everybody (past it the oldest ended runs are
+16 active runs and 200 kept runs per client; 256 MiB of ended runs' outputs for everybody (outputs at their base64 size) (past it the oldest ended runs are
 forgotten early: outputs, last message, stderr, validator output and kept events, the events at the size their JSON text takes in
 memory, one or two bytes a character plus 32 bytes each; an active run's events count only once it ends); kept events 2000 and
-1 MiB of JSON per run, 64 KiB and 64 levels of nesting per event; 128 MiB of request bodies in flight and 32 event streams per client; 4 waiting logins per client; run time
+1 MiB of JSON per run, 64 KiB and 64 levels of nesting per event; 128 MiB of request bodies in flight (at least the body cap), 128 MiB of answer bytes not yet read (past it a run's answer is a 429 and an event stream is closed; one answer always goes) and 32 event streams per client; 4 waiting logins per client; run time
 1 s–2 h (default 40 min); validator 1 s–10 min (default 60 s); runs and ended logins are kept 30 minutes; a status is cached 30 s.
 
 ## API v1
 
 Every request carries `Authorization: Bearer <token>`. Bodies and answers are JSON. Errors are `{ "error": { "code", "message" } }`
 with 400 (bad input), 401 (token), 404 (unknown, or another client's), 409 (busy, not usable, not waiting for a code), 413 (too
-large), 429 (too many runs or logins). `:user` is `[A-Za-z0-9_-]{1,64}`, your own id for the user.
+large), 503 (`status_failed`: a status or logout box failed, out of time say; ask again), 429 (too many runs, logins, request bytes in flight, event streams or answer bytes not yet read), 507 (no room for a run's
+files now: ask again later). `:user` is `[A-Za-z0-9_-]{1,64}`, your own id for the user.
 
 ### Harnesses and logins
 
@@ -42,12 +43,12 @@ large), 429 (too many runs or logins). `:user` is `[A-Za-z0-9_-]{1,64}`, your ow
 |---|---|
 | `GET /v1/harnesses` | `{ harnesses: [{ id, name, version, usable, why, webSearch }] }`: what this client may use, as `detect()` found it at start. `webSearch`: the harness supports it (whether this client may ask for it is its entry's `webSearch`). |
 | `GET /v1/users/:user/harnesses` | `{ harnesses: [{ harness, installed, loggedIn, method, plan, checkedAt } \| { harness, busy: true, …last known } \| { harness, error }] }`: each usable harness, one after another. |
-| `GET /v1/users/:user/harnesses/:h` | `{ harness, installed, loggedIn, method, plan, checkedAt }`: a status at most 30 s old, else asked in a box; 409 `busy` when it would have to ask while that user's login or run of `:h` holds the box. |
-| `POST /v1/users/:user/harnesses/:h/login` | Starts the CLI's own login in the user's box and waits up to 30 s for its URL: `{ state, url, code, needsCode, startedAt, expiresAt }`. A newer login for the same user and harness replaces the old one. |
+| `GET /v1/users/:user/harnesses/:h` | `{ harness, installed, loggedIn, method, plan, checkedAt }`: a status at most 30 s old, else asked in a box; 409 `busy` when it would have to ask while that user's login or run of `:h` holds the box; 503 `status_failed` when the box failed (out of time, say). |
+| `POST /v1/users/:user/harnesses/:h/login` | Starts the CLI's own login in the user's box and waits up to 30 s for its URL: `{ state, url, code, needsCode, startedAt, expiresAt }`. `expiresAt` is when the CLI's 10 minutes end: counted from the request until the CLI's box starts (a login waiting for the user's lock behind a run starts later), then from the box's start. A newer login for the same user and harness replaces the old one. |
 | `GET …/login` | The current (or, for 30 minutes, the last) login: `state` is `starting`, `waiting`, `done` (with `status`) or `failed` (with `error`). 404: none. |
 | `POST …/login/code` `{ code }` | Paste-code logins (`needsCode: true`, Claude Code): the code the login page showed the user, to the CLI's stdin, once. 204, 409 when not waiting for one. |
 | `DELETE …/login` | Cancel. 204. |
-| `POST …/:h/logout` | The CLI's own logout, then its status. |
+| `POST …/:h/logout` | The CLI's own logout, then its status; 503 `status_failed` as above. |
 | `DELETE /v1/users/:user` | Cancels the user's runs (queued ones included) and logins, then deletes all their homes. 204. |
 
 Show the user `url` (and `code` for a device login) and nothing else; the URL is always https on the harness's own login hosts.
@@ -72,7 +73,8 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
 ```
 
 - The run's folder is `/work` inside the box (and the CLI's working directory), so the prompt, the files and the tool rules can
-  name `/work/...` in advance. Paths are relative, plain segments; a path given twice is refused. A file may add `copies: [paths]`
+  name `/work/...` in advance. Paths are relative, plain segments (each at most 255 bytes and a path at most 1024, in UTF-8); a
+  path given twice is refused. A file may add `copies: [paths]`
   (up to 8) to be written there too, without sending the bytes again (they count against the files cap each time).
 - `readonly`: folders whose files are bound read-only over `/work/<folder>` for the CLI and the validator: the model can read a
   skill and run its validator but not change them.
@@ -132,17 +134,21 @@ A login ends by itself after 10 minutes. Device logins (Codex, Grok) finish when
 ```
 
 - `state`: `queued` (waiting for the user's lock or a slot) → `running` → `validating` → `done` | `failed` | `canceled`. `failed`
-  covers the CLI's own failure, a time limit (`result.timedOut`, outputs and validator still there) and the watchdog (`result.why`).
+  covers the CLI's own failure, a time limit (`result.timedOut`, outputs and validator still there unless `error` is set) and the
+  watchdog (`result.why`). Check `error` first: with it, `validator` and `outputs` are `null`.
 - `result.loggedIn`: present after a CLI failure; `false` means the user must log in again.
 - `usage.unknown: true`: the CLI reported no usage. Claude's input counts cache tokens.
 - `result.events`, `result.eventsTruncated`: only for a run with `events: true`. The top-level `events` stays the count of all
   events.
-- `error`: the service could not run it at all.
+- `error`: the service could not run it, or its validator's box could not start (then `result` is the CLI's result, `validator`
+  and `outputs` are `null`, and the state is `failed`).
 
 `GET /v1/runs/:id/events` → Server-Sent Events: `state` (on each state change), `progress` (at most once a second while events
 arrive: `stage`, `events`), and `end` (the full run, outputs included), then the stream closes. Each `data:` is the run as JSON
 on one line; U+2028 and U+2029 inside its strings are written as `\u2028` and `\u2029` (here and in `GET /v1/runs/:id`), so a
-parser that ends lines at them still reads the whole line. Split lines at `\n` only.
+parser that ends lines at them still reads the whole line. Split lines at `\n` only. The service closes a stream early when the
+client's answer bytes not yet read pass their cap (another of its connections stalled): the client's `events()` then rejects with
+`stream_ended`, and `GET /v1/runs/:id` has the run once those bytes are read. POST /v1/runs always answers with the run it started.
 `DELETE /v1/runs/:id` cancels (204): a running CLI is killed; a queued run leaves the user's lock and the slot queue at once and
 ends without a box. Runs are kept 30 minutes after they end. **A restart forgets every run**: an unknown id is 404,
 and the client starts the run again.
@@ -177,7 +183,7 @@ await hb.run({
 Then, from the ended run: `outputs['out/draft.json']` (base64; `null` means not written) is the draft, `validator.out` is the
 validator's JSON (`{ errors }`), `result.text` is the CLI's last message (Codex's from its `-o` file), `result.usage` the tokens
 (`unknown` when none), `result.loggedIn === false` means the user must log in again, `result.timedOut` is the runner's "stopped
-at the deadline" case (outputs and validator are still there), and a missing `out/draft.md` or `out/handoff.md` is `null`. The
+at the deadline" case (outputs and validator are still there, unless the run has an `error`), and a missing `out/draft.md` or `out/handoff.md` is `null`. The
 job's lease and progress map onto the run: `GET /v1/runs/:id` or the event stream while it runs, `DELETE /v1/runs/:id` when the
 user cancels, and a 404 after a service restart means queue it again.
 
@@ -194,7 +200,8 @@ const { id } = await hb.run({ user: 'u_123', harness: 'codex', prompt: '…', fi
 const run = await hb.events(id, (event, r) => console.log(event, r.state, r.stage)); // resolves to the ended run
 ```
 
-Calls reject with `HarnessboxError` (`status`, `code`).
+Calls reject with `HarnessboxError` (`status`, `code`) for an answer of the service, or with the socket's own `Error` when there is
+no answer.
 
 ## Deploy
 
@@ -218,6 +225,9 @@ After every deploy: `deploy/probe.mjs` inside the service container (isolation, 
   results for credentials. Only let clients you would trust with those credentials connect, and keep the CLIs' tool rules tight.
 - **Tokens** are compared by their SHA-256; the clients file holds only hashes. Whoever can reach the socket or port and holds a
   token is that client. Keep the socket volume to the client apps and the TCP port on a private network.
+- **Anyone on the socket can deny service to the others**, token or not: the 512 connections are for everybody, counted before the
+  token is read (a connection without its headers in 10 s is dropped, but one can keep reconnecting). The per-client caps do not
+  reach this far. Share one service only among apps that trust each other not to; else run one service per app.
 - **What the service keeps**: runs (prompts never; outputs, the CLI's last message and, with `events: true`, its events for 30
   minutes) and login sessions (URL and code until 30 minutes after the end) in memory only. Logs carry ids, states and egress denials.
 - **Events carry everything the CLI printed**, not only the last message: tool calls and their results (Codex's command output,

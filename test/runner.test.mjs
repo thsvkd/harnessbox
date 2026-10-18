@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Busy, claudeCode, codex, createRunner, grok } from '../src/index.mjs';
@@ -26,7 +26,8 @@ process.env.XAI_API_KEY = 'xai-must-not-reach';
 async function world({ env = {}, ...o } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hb-runner-test-')), homes = join(root, 'homes'), logs = [];
   let n = 0;
-  const hb = await createRunner({ homes, adapters: [claudeCode, codex, grok], bins: FAKE, socat: join(HERE, 'fake-socat'), log: (l) => logs.push(l), passEnv: env, ...o });
+  let hb;
+  try { hb = await createRunner({ homes, adapters: [claudeCode, codex, grok], bins: FAKE, socat: join(HERE, 'fake-socat'), log: (l) => logs.push(l), passEnv: env, ...o }); } catch (e) { rmSync(root, { recursive: true, force: true }); throw e; }
   const home = (u, id) => join(homes, u, id);
   const logIn = (u, id) => { mkdirSync(join(home(u, id), CRED[id], '..'), { recursive: true }); writeFileSync(join(home(u, id), CRED[id]), '{"fake":true}'); };
   const job = () => { const d = join(root, `job-${n++}`); mkdirSync(d); return d; };
@@ -499,5 +500,184 @@ test('locks and slots: one box at a time per user and harness, maxJobs at once, 
     assert.equal((await l.done).error, 'canceled');
     assert.ok(!existsSync(join(w.homes, 'alice')) && existsSync(join(w.homes, 'bob')));
     assert.ok(lstatSync(w.homes).isDirectory());
+  } finally { w.close(); }
+});
+
+test('exec waits for a job slot like run: a validator does not start while maxJobs jobs run', BOX, async () => {
+  const w = await world({ maxJobs: 1 });
+  try {
+    await w.hb.detect();
+    w.logIn('bob', 'claude-code');
+    let jobEnded = false;
+    const job = w.hb.run('bob', 'claude-code', { prompt: 'FAKE_MODE=hang', dir: w.job(), timeoutMs: 2000 }).then((r) => { jobEnded = true; return r; });
+    await sleep(600);
+    const r = await w.hb.exec('alice', 'claude-code', ['/usr/bin/true'], { home: join(w.root, 'throwaway') });
+    assert.equal(r.code, 0);
+    assert.ok(jobEnded, 'the exec box started only once the job let go of the slot');
+    assert.equal((await job).timedOut, true);
+  } finally { w.close(); }
+});
+
+test('a box writes only its home, its folder, /tmp, /run and a sized /dev/shm: the root and /dev are read-only', BOX, async () => {
+  const w = await world();
+  try {
+    await w.hb.detect();
+    const d = w.job();
+    const r = await w.hb.exec('alice', 'claude-code', ['/bin/bash', '-c', 'for f in /big /homes-x /dev/big "$HOME/f" "$PWD/f" /tmp/f /run/f /dev/shm/f /dev/null; do (echo x > "$f") 2>/dev/null && echo "ok $f" || echo "no $f"; done; df -B1 --output=size /dev/shm | tail -1'], { dir: d, boxDir: d });
+    assert.deepEqual(r.out.trim().split('\n'), ['no /big', 'no /homes-x', 'no /dev/big', `ok ${w.home('alice', 'claude-code')}/f`, `ok ${d}/f`, 'ok /tmp/f', 'ok /run/f', 'ok /dev/shm/f', 'ok /dev/null', '268435456']);
+  } finally { w.close(); }
+});
+
+test('runner: one user id form per runner, whole-ms times, a timed-out short box says so, and a home under a bound folder stops startup', BOX, async () => {
+  const w = await world();
+  try {
+    await w.hb.detect();
+    await w.hb.exec('alice', 'claude-code', ['/usr/bin/true'], { home: join(w.root, 'h1') });
+    await assert.rejects(w.hb.exec('alice/codex', 'claude-code', ['/usr/bin/true'], { home: join(w.root, 'h2') }), /not both forms/);
+    await assert.rejects(w.hb.purge('alice/codex'), /not both forms/);
+    for (const bad of [Infinity, NaN, 2 ** 31, 0.5, -1]) {
+      await assert.rejects(w.hb.run('alice', 'claude-code', { prompt: 'x', dir: w.job(), timeoutMs: bad }), /timeoutMs must be a whole number/, String(bad));
+      await assert.rejects(w.hb.exec('alice', 'claude-code', ['/usr/bin/true'], { ms: bad }), /ms must be a whole number/, String(bad));
+    }
+    await assert.rejects(w.hb.status('alice', 'claude-code', { waitMs: Infinity }), /waitMs must be a whole number/);
+    const slow = await w.hb.exec('alice', 'claude-code', ['/bin/sleep', '30'], { ms: 1000, home: join(w.root, 'h3') });
+    assert.equal(slow.timedOut, true);
+    assert.equal((await w.hb.exec('alice', 'claude-code', ['/usr/bin/true'], { home: join(w.root, 'h4') })).timedOut, false);
+  } finally { w.close(); }
+  const home = process.env.HOME;
+  process.env.HOME = HERE; // the fake CLIs' folder, bound into every box, now holds the runner's home
+  try { await assert.rejects(world(), /holds the runner's home/); } finally { process.env.HOME = home; }
+  // the fake CLIs' folder holding the homes root: every box could read every user's credential
+  await assert.rejects(createRunner({ homes: join(HERE, 'homes-x'), adapters: [claudeCode, codex, grok], bins: FAKE, socat: join(HERE, 'fake-socat') }), /the homes root/);
+  assert.ok(!existsSync(join(HERE, 'homes-x')), 'a refused start leaves no folder behind');
+  // /usr and /etc are in every box too: a runner's home under one of them is refused
+  process.env.HOME = '/etc/hb-runner-home';
+  try { await assert.rejects(world(), /boxes would see \/etc read-only/); } finally { process.env.HOME = home; }
+});
+
+test('purge asks for every harness lock at once: a job for another harness that comes meanwhile waits behind it', BOX, async () => {
+  const w = await world();
+  try {
+    await w.hb.detect();
+    for (const id of ['claude-code', 'codex']) w.logIn('alice', id);
+    const first = w.hb.run('alice', 'claude-code', { prompt: 'FAKE_MODE=hang', dir: w.job(), timeoutMs: 1500 });
+    await sleep(500);
+    let purged = 0, started = 0;
+    const purge = w.hb.purge('alice').then(() => { purged = Date.now(); });
+    const second = w.hb.run('alice', 'codex', { prompt: 'x', dir: w.job(), onStart: () => { started = Date.now(); } });
+    await Promise.all([first, purge]);
+    const r = await second;
+    assert.ok(purged && started > purged, 'the codex job started only after the purge');
+    assert.equal(r.loggedIn, false, 'and found the login purged');
+  } finally { w.close(); }
+});
+
+test('a status stopped by close() is an error, never logged out; a login session has expiresAt once its box started', BOX, async () => {
+  const marker = '.claude/status-verification';
+  const w = await world({ env: { FAKE_STATUS_MARKER: marker } });
+  try {
+    await w.hb.detect();
+    const before = Date.now(), l = w.hb.login('bob', 'claude-code');
+    assert.equal(l.expiresAt, null);
+    await l.waiting;
+    assert.ok(l.expiresAt >= before + 10 * 60e3 && l.expiresAt <= Date.now() + 10 * 60e3, 'its 10 minutes, from its box');
+    l.cancel();
+    await l.done;
+    w.logIn('alice', 'claude-code'); // the fake's status sleeps 2 s for a logged-in user, after writing the marker
+    const st = w.hb.status('alice', 'claude-code');
+    const path = join(w.home('alice', 'claude-code'), marker);
+    for (let i = 0; i < 100 && !existsSync(path); i++) await sleep(30);
+    assert.ok(existsSync(path), 'the status box started');
+    w.hb.close();
+    await assert.rejects(st, /the status check was stopped/);
+  } finally { w.close(); }
+});
+
+test('startup refuses a bound folder that holds the homes root or the temp folder, compared as real paths (through a link too)', BOX, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-guard-')), real = join(root, 'real'), link = join(root, 'link');
+  try {
+    mkdirSync(real);
+    symlinkSync(real, link);
+    writeFileSync(join(real, 'grok'), '#!/bin/sh\n', { mode: 0o755 });
+    // homes under a link to the CLI's folder, not made yet: the real path is the folder the boxes see
+    await assert.rejects(createRunner({ homes: join(link, 'homes'), adapters: [grok], bins: { grok: join(real, 'grok') }, socat: join(HERE, 'fake-socat') }), /the homes root/);
+    const tmp = process.env.TMPDIR;
+    process.env.TMPDIR = join(link, 'tmp'); // the temp folder under the CLI's folder, through a link
+    mkdirSync(join(real, 'tmp'));
+    try { await assert.rejects(createRunner({ homes: join(root, 'h2'), adapters: [grok], bins: { grok: join(real, 'grok') }, socat: join(HERE, 'fake-socat') }), /the temp folder/); } finally { if (tmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = tmp; }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('hide: a runner file under /etc cannot be read in any box; other paths are refused at startup', BOX, async () => {
+  const w = await world({ hide: ['/etc/hostname'] });
+  try {
+    await w.hb.detect();
+    const r = await w.hb.exec('alice', 'claude-code', ['/bin/sh', '-c', 'cat /etc/hostname && echo READ; wc -c < /etc/passwd'], { home: join(w.root, 'h') });
+    assert.ok(!r.out.includes('READ') && !r.out.includes(readFileSync('/etc/hostname', 'utf8').trim()), r.out);
+    assert.ok(Number(r.out.trim().split('\n').at(-1)) > 0, 'the rest of /etc is there');
+  } finally { w.close(); }
+  for (const hide of [['/tmp/x'], ['etc/x'], ['/etc/../tmp/x'], '/etc/x']) await assert.rejects(world({ hide }), /hide: absolute paths under \/usr or \/etc/, JSON.stringify(hide));
+  for (const f of ['/etc/hb-no-such-file', '/etc/ssl', '/etc/localtime']) await assert.rejects(world({ hide: [f] }), /is not a regular file/, f); // missing, a folder, a link
+});
+
+test('a box bwrap could not set up is "the box did not start": a status error, a run without a loggedIn guess, detect says why', BOX, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-flaky-')), flag = join(root, 'fail'), wrapper = join(root, 'bwrap');
+  // bwrap itself, until the flag exists: then it fails before the command runs, as bwrap does out of pids or namespaces
+  writeFileSync(wrapper, `#!/bin/sh\n[ -e '${flag}' ] && { echo 'bwrap: Creating new namespace failed: Resource temporarily unavailable' >&2; exit 1; }\nexec bwrap "$@"\n`, { mode: 0o755 });
+  const w = await world({ bwrap: wrapper });
+  try {
+    await w.hb.detect();
+    for (const id of ['claude-code', 'codex']) w.logIn('alice', id);
+    assert.equal((await w.hb.status('alice', 'claude-code')).loggedIn, true);
+    writeFileSync(flag, '');
+    await assert.rejects(w.hb.status('alice', 'claude-code'), /the box did not start/);
+    const r = await w.hb.run('alice', 'codex', { prompt: 'x', dir: w.job() });
+    assert.equal(r.why, 'the box did not start');
+    assert.equal(r.loggedIn, undefined, 'no status asked, none read as logged out');
+    const rows = await w.hb.detect();
+    assert.match(rows[0].why, /^--version failed \(the box did not start: bwrap: Creating new namespace failed/);
+    rmSync(flag);
+    await w.hb.detect();
+    assert.equal((await w.hb.status('alice', 'claude-code')).loggedIn, true, 'a box that ran is read as before');
+  } finally { w.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('detect says a probe box did not start at whichever step it was; a spawn that fails (bwrap gone) rejects and ends nothing', BOX, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hb-flaky2-')), count = join(root, 'n'), wrapper = join(root, 'bwrap');
+  // bwrap itself for the first box, then it fails before the command runs
+  writeFileSync(wrapper, `#!/bin/sh\nn=$(cat '${count}' 2>/dev/null || echo 0); echo $((n + 1)) > '${count}'\n[ "$n" -ge 1 ] && { echo 'bwrap: Creating new namespace failed' >&2; exit 1; }\nexec bwrap "$@"\n`, { mode: 0o755 });
+  const w = await world({ bwrap: wrapper, adapters: [claudeCode] });
+  try {
+    const [row] = await w.hb.detect(); // --version ran; the options box did not start
+    assert.match(row.why, /^--help failed \(the box did not start: bwrap: Creating new namespace failed\)$/);
+    rmSync(wrapper);
+    const before = readdirSync(tmpdir()).filter((n) => n.startsWith('hb-egress-')).length;
+    await assert.rejects(w.hb.exec('alice', 'claude-code', ['/usr/bin/true'], { net: 'proxy', home: join(root, 'h') }), /the box did not start \(spawn failed\)/);
+    await sleep(50); // the next tick's 'error' event: no crash
+    assert.equal(readdirSync(tmpdir()).filter((n) => n.startsWith('hb-egress-')).length, before, 'its proxy socket is gone');
+  } finally { w.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('purge removes a home holding folders the box made 0555 or 000', BOX, async () => {
+  const w = await world();
+  try {
+    await w.hb.detect();
+    w.logIn('alice', 'claude-code');
+    const r = await w.hb.exec('alice', 'claude-code', ['/bin/sh', '-c', 'mkdir -p "$HOME/x/y" "$HOME/z" && chmod 555 "$HOME/x/y" "$HOME/x" && chmod 000 "$HOME/z" && chmod 555 "$HOME/.claude"']);
+    assert.equal(r.code, 0, r.out);
+    await w.hb.purge('alice');
+    assert.ok(!existsSync(join(w.homes, 'alice')));
+  } finally { w.close(); }
+});
+
+test('a folder whose name is not UTF-8 counts against maxBytes, and the scrub removes it', BOX, async () => {
+  const w = await world({ maxBytes: 2 ** 20 });
+  try {
+    await w.hb.detect();
+    w.logIn('alice', 'claude-code');
+    const r = await w.hb.exec('alice', 'claude-code', ['/bin/bash', '-c', 'cd "$HOME" && mkdir $\'\\xff\' && head -c 20000000 /dev/zero > $\'\\xff\'/big && sleep 6']);
+    assert.match(r.why ?? '', /more than 1048576 bytes/, 'the watchdog saw it');
+    assert.equal((await w.hb.status('alice', 'claude-code')).loggedIn, true, 'the next box scrubbed it away and ran');
+    assert.deepEqual(readdirSync(w.home('alice', 'claude-code')).sort(), ['.claude']);
   } finally { w.close(); }
 });

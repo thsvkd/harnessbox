@@ -8,7 +8,8 @@ export type ReadOnlyBind = string | readonly [source: string, destination: strin
 export type JsonEvent = Record<string, any>;
 export interface Usage { input: number; output: number; unknown?: true }
 export interface Status { installed: boolean; loggedIn: boolean; method?: string | null; plan?: string | null }
-export interface ShortResult { code: number; out: string; why: string | null }
+/** timedOut: the box was stopped at its time limit (status: never read as logged out) */
+export interface ShortResult { code: number; out: string; why: string | null; timedOut?: boolean }
 export interface Accumulator {
   text: string; usage: Usage; reports: number; error: string; stage: string; last?: string;
   [key: string]: unknown;
@@ -44,6 +45,8 @@ export interface RunnerOptions {
   bins?: Record<string, string>; pins?: Record<string, string>; bwrap?: string; socat?: string;
   maxJobs?: number; maxQuick?: number; maxProcs?: number; maxBytes?: number; maxEntries?: number; maxOutputBytes?: number;
   log?: (line: string) => void | Promise<void>; passEnv?: Env;
+  /** Files of the runner's under /usr or /etc (every box sees those read-only) that boxes cannot read: a service's clients file. */
+  hide?: readonly string[];
 }
 export interface DetectRow {
   id: string; name: string; bin: string | null; version: string | null; usable: boolean; why: string | null; has: Set<string>;
@@ -79,6 +82,8 @@ export type LoginResult = { ok: true; status: Status } | { ok: false; error: str
 export interface LoginSession {
   state: 'starting' | 'waiting' | 'refused' | 'done' | 'failed';
   url: string | null; code: string | null; needsCode: boolean; error?: string;
+  /** ms since the epoch: when the CLI's 10 minutes end, set once its box started (a login may wait for the user's lock first) */
+  expiresAt: number | null;
   waiting: Promise<LoginWaiting>; done: Promise<LoginResult>;
   submitCode(code: string): boolean; cancel(): void;
 }
@@ -115,6 +120,10 @@ export interface ProxyOptions {
 export function startProxy(sockPath: string, options: ProxyOptions): Promise<Server>;
 export function scrubHome(home: string, keep?: readonly string[], jsonKeys?: Record<string, readonly string[]>): Promise<void>;
 export function readOut(realDir: string, name: string, max?: number): Promise<string | null>;
+/** rm -rf that also removes folders a box made 0555 or 000 and chains deeper than PATH_MAX; never follows a link in the tree. */
+export function rmTree(path: string): Promise<void>;
+/** A TLS ClientHello's server_name, lowercased: undefined while its record is incomplete, null when it names no single host or offers ECH. */
+export function helloSni(buf: Buffer): string | null | undefined;
 export function readOutBytes(realDir: string, name: string, max?: number): Promise<Buffer | null>;
 export function parseStat(text: string): { pid: number; ppid: number };
 export function countDescendants(rootPids: readonly number[], procDir?: string): Promise<Map<number, number>>;
@@ -123,5 +132,6 @@ export function seccompFilter(arch?: string): Buffer;
 export interface BoxOptions {
   home: string; path: string; cmd: readonly string[]; dir?: string; net?: 'none' | 'proxy'; sock?: string; socat?: string;
   env?: Env; roBinds?: readonly ReadOnlyBind[]; chdir?: string; maxTasks?: number; nested?: boolean; seccomp?: boolean; boxDir?: string;
+  hide?: readonly string[]; status?: boolean;
 }
 export function boxArgs(options: BoxOptions): string[];

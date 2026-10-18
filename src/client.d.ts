@@ -4,7 +4,8 @@ export class HarnessboxError extends Error { status: number; code?: string; cons
 export interface HarnessStatus { harness: string; installed?: boolean; loggedIn?: boolean; method?: string | null; plan?: string | null; checkedAt?: string; busy?: true; error?: string }
 export interface LoginView {
   state: 'starting' | 'waiting' | 'done' | 'failed'; url: string | null; code: string | null; needsCode: boolean;
-  startedAt: string; expiresAt: string; error?: string; status?: HarnessStatus;
+  /** expiresAt: when the CLI's 10 minutes end: from the request until the CLI's box starts (a login behind the user's lock starts later), then from the box's start */
+  startedAt: string; expiresAt: string; error?: string; status?: Omit<HarnessStatus, 'harness' | 'checkedAt' | 'busy' | 'error'>;
 }
 export interface RunFile { path: string; base64?: string; text?: string; copies?: string[] }
 export interface RunRequest {

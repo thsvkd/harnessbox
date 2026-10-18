@@ -5,15 +5,18 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { access, lstat, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
-import { boxArgs, countDescendants, diskUse, ID, readOut, scrubHome, seccompFilter, startProxy } from './box.mjs';
+import { boxArgs, countDescendants, diskUse, ID, readOut, rmTree, scrubHome, seccompFilter, startProxy } from './box.mjs';
 
 const LOGIN_MS = 10 * 60e3, PROBE_MS = 30e3;
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g, CODE = /^[\x21-\x7e]{1,2048}$/;
 const USER = new RegExp(`^${ID.source.slice(1, -1)}(/${ID.source.slice(1, -1)})?$`), MODEL = /^[A-Za-z0-9._:@/-]{1,100}$/;
+
+/** A time for setTimeout: a whole number of ms it does not clamp (past 2^31 - 1 or not a number, Node waits 1 ms instead). */
+const duration = (ms, what, min = 1) => { if (!Number.isSafeInteger(ms) || ms < min || ms > 2 ** 31 - 1) throw new Error(`${what} must be a whole number of ms, ${min}..${2 ** 31 - 1}`); return ms; };
 
 /** A status or logout that could not get the user's lock (or a quick-box slot) in time: ask again later. */
 export class Busy extends Error {}
@@ -87,15 +90,19 @@ function locker() {
  * @param {number} [o.maxOutputBytes]  cumulative stdout + stderr per job (default 8 MiB)
  * @param {(line: string) => void} [o.log]  egress denials and watchdog notes (never credentials, codes or URLs)
  * @param {Record<string,string>} [o.passEnv]  extra variables for every box (tests)
+ * @param {string[]} [o.hide]  files of the runner's under /usr or /etc (which every box sees read-only) that boxes cannot read
  */
 export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwrap = 'bwrap', socat = 'socat', maxJobs = 3, maxQuick = 2, maxProcs = 128,
-  maxBytes = 2 ** 30, maxEntries = 20000, maxOutputBytes = 8 * 1024 * 1024, log = () => {}, passEnv = {} }) {
+  maxBytes = 2 ** 30, maxEntries = 20000, maxOutputBytes = 8 * 1024 * 1024, log = () => {}, passEnv = {}, hide = [] }) {
   const filter = seccompFilter(); // a missing security boundary is a startup error, never an optional warning
   if (typeof homes !== 'string' || !isAbsolute(homes)) throw new Error('homes must be an absolute path');
   if (!Array.isArray(adapters)) throw new Error('adapters must be an array');
   for (const [name, value] of Object.entries({ maxJobs, maxQuick, maxProcs, maxBytes, maxEntries, maxOutputBytes })) {
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive safe integer`);
   }
+  if (!Array.isArray(hide) || !hide.every((f) => typeof f === 'string' && /^\/(usr|etc)\/./.test(f) && !f.split('/').includes('..'))) throw new Error('hide: absolute paths under /usr or /etc');
+  // bwrap binds over a regular file only: anything else (missing, a folder, a link) would stop every box from starting
+  for (const f of hide) if (!(await lstat(f).catch(() => null))?.isFile()) throw new Error(`hide: ${f} is not a regular file`);
   const report = (line) => { try { Promise.resolve(log(line)).catch(() => {}); } catch { /* the log sink cannot stop users' boxes */ } };
   const byId = new Map(adapters.map((a) => [a.id, a]));
   if (byId.size !== adapters.length) throw new Error('duplicate harness id');
@@ -108,6 +115,19 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   const NODE_DIR = dirname(dirname(process.execPath));
   const BIN_DIRS = [...new Set([dirname(process.execPath), ...[...Object.values(BIN), SOCAT].filter((b) => b?.includes('/')).map((b) => dirname(b))])];
   const RO = [...new Set([...outside(NODE_DIR), ...BIN_DIRS.filter((d) => !`${d}/`.startsWith(`${NODE_DIR}/`)).flatMap(outside)])];
+  // every box sees these (and /usr and /etc, boxArgs): never the whole root, the runner user's home (its ~/.ssh, its own CLI logins),
+  // the homes root (every user's credential) or the temp folder (every box's egress socket, a service's run folders); as real paths
+  const real = (p) => realpath(p).catch(() => resolve(p));
+  const made = await mkdir(homes, { recursive: true, mode: 0o700 }); // a root not made yet has no real path: one under a link would slip by
+  const refuse = async (message) => { if (made) await rm(made, { recursive: true, force: true }); throw new Error(message); }; // leaves nothing behind
+  let home = null;
+  try { home = homedir(); } catch { /* no HOME and no passwd entry for this uid: no home to keep out */ }
+  const held = await Promise.all([home, homes, tmpdir()].filter(Boolean).map(real));
+  for (const d of new Set(['/usr', '/etc', ...await Promise.all(RO.map(real))])) {
+    if (d === '/' || held.some((h) => `${h}/`.startsWith(`${d}/`))) await refuse(`boxes would see ${d} read-only, which holds the runner's home, the homes root or the temp folder: keep them out of /usr, /etc and the Node and CLI folders`);
+  }
+  // a box's egress socket (tmpdir()/hb-egress-<16 hex>.sock) must fit a unix socket path (108 bytes with its NUL)
+  if (Buffer.byteLength(join(tmpdir(), `hb-egress-${'0'.repeat(16)}.sock`)) > 107) await refuse(`the temp folder's path is too long for the boxes' sockets: ${tmpdir()}`);
   const PATH_IN_BOX = [...BIN_DIRS.filter((d) => outside(d).length), '/usr/local/bin', '/usr/bin', '/bin'].join(':');
   const stop = new AbortController(), operations = new Set();
   const ensureOpen = () => { stop.signal.throwIfAborted(); };
@@ -118,8 +138,14 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   const homeOf = (userId, a) => join(homes, userId, a.id);
   const cli = (a, args) => [BIN[a.id], ...(a.globalArgs ?? []), ...args];
   const harness = (id) => { const a = byId.get(id); if (!a) throw new Error(`unknown harness ${id}`); return a; };
-  // a user id is `user` or `scope/user` (a service keeps each client's users under its own folder): one or two ids
-  const user = (userId) => { if (!USER.test(userId ?? '')) throw new Error('bad user id'); return userId; };
+  // a user id is `user` or `scope/user` (a service keeps each client's users under its own folder): one or two ids, and one form per
+  // runner: 'alice/codex' would live inside 'alice''s Codex home
+  let form = null;
+  const user = (userId) => {
+    if (!USER.test(userId ?? '')) throw new Error('bad user id');
+    if ((form ??= userId.includes('/')) !== userId.includes('/')) throw new Error(`bad user id: this runner's ids are ${form ? 'scope/user' : 'user'}, not both forms`);
+    return userId;
+  };
   let detected = new Map(); // id -> detect() row
   const usable = (id) => { const a = harness(id); if (!detected.get(id)?.usable) throw new Error(`${a.name} is not usable on this runner`); return a; };
 
@@ -141,24 +167,31 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
       proxy = await startProxy(sock, { allow: a.hosts, label, log: report });
     }
     // the kernel's per-box cap counts threads too (a CLI has a few dozen): the watchdog counts processes against maxProcs
-    const args = boxArgs({ home, dir, boxDir, net, sock, socat: SOCAT, path: PATH_IN_BOX, env: { ...passEnv, ...a.env, ...env }, roBinds: [...RO, ...roBinds], chdir: boxDir ?? home,
-      cmd, maxTasks: maxProcs * 4, nested, seccomp: !!filter });
+    const args = boxArgs({ home, dir, boxDir, net, sock, socat: SOCAT, path: PATH_IN_BOX, env: { ...passEnv, ...a.env, ...env }, roBinds: [...RO, ...roBinds], hide, chdir: boxDir ?? home,
+      cmd, maxTasks: maxProcs * 4, nested, seccomp: !!filter, status: true });
     let child;
     try {
       signal.throwIfAborted();
-      child = spawn(BWRAP, args, { stdio: [stdin, 'pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH } });
+      child = spawn(BWRAP, args, { stdio: [stdin, 'pipe', 'pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH } });
+      // no process (out of file descriptors, bwrap gone): no stdio either, and an 'error' event next tick that must not end the runner
+      if (!child.pid) { child.on('error', () => {}); throw new Error('the box did not start (spawn failed)'); }
     } catch (e) {
       if (proxy) { proxy.close(); await rm(sock, { force: true }); } // an argument spawn refuses (a NUL byte, say) leaves nothing open
       throw e;
     }
     child.stdio[3].on('error', () => {}).end(filter);
     // Stopping a box is SIGKILL to bwrap: --die-with-parent takes everything in it (it is a session of its own, so a group kill would not).
-    const b = { child, home, dir, why: null, kill: () => { try { child.kill('SIGKILL'); } catch { /* gone */ } } };
+    const b = { child, home, dir, why: null, killed: false, kill: () => { b.killed = true; try { child.kill('SIGKILL'); } catch { /* gone */ } } };
+    // a box bwrap could not set up (out of pids or namespaces, a bind that fails) ends without running its command: never read that
+    // as the CLI's answer (an empty status is "logged out")
+    let status = '';
+    child.stdio[4].setEncoding('utf8').on('data', (d) => { status = (status + d).slice(-4096); }).on('error', () => {});
     const abort = () => b.kill();
     if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
     child.stdin?.on('error', () => {});
     if (child.pid) boxes.set(child.pid, b);
     b.closed = new Promise((done) => { child.on('error', () => done(-1)); child.on('close', (c) => done(c ?? -1)); }).then(async (code) => {
+      if (!b.killed && !status.includes('"exit-code"')) b.why ??= 'the box did not start';
       signal.removeEventListener('abort', abort);
       boxes.delete(child.pid);
       if (proxy) { proxy.close(); await rm(sock, { force: true }); }
@@ -176,10 +209,11 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
     b.child.stderr.setEncoding('utf8');
     b.child.stdout.on('data', take);
     b.child.stderr.on('data', take);
-    const t = setTimeout(b.kill, ms);
+    let timedOut = false;
+    const t = setTimeout(() => { timedOut = true; b.kill(); }, ms);
     const code = await b.closed;
     clearTimeout(t);
-    return { code, out, why: b.why };
+    return { code, out, why: b.why, timedOut };
   }
 
   // The watchdog: every 2 s, each box's process count (the in-box RLIMIT_NPROC is the hard cap; this names the reason and stops it)
@@ -217,20 +251,29 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
         if (!r.bin) { r.why = 'binary not found'; continue; }
         const v = await run(['--version']);
         r.version = /\d+\.\d+\.\d+/.exec(v.out)?.[0] ?? null;
+        // a probe box that did not start says so, never as the CLI's answer (a missing option, a failed check)
+        const boxFailed = (step, x) => `${step} failed (${x.why}: ${x.out.split('\n')[0].slice(0, 200)})`;
+        if (v.why) { r.why = boxFailed('--version', v); continue; }
         if (v.code !== 0 || !r.version) { r.why = `--version failed (exit ${v.code})`; continue; }
         if (Object.hasOwn(pins, a.id) && pins[a.id] !== r.version) { r.why = `version ${r.version}, pinned ${pins[a.id]}`; continue; }
         if (a.flags) {
-          const help = (await run(a.flags.args)).out, missing = a.flags.needs.filter((f) => !help.includes(f));
+          const h = await run(a.flags.args);
+          if (h.why) { r.why = boxFailed(a.flags.args.join(' '), h); continue; }
+          const help = h.out, missing = a.flags.needs.filter((f) => !help.includes(f));
           for (const f of a.flags.optional ?? []) if (help.includes(f)) r.has.add(f);
           if (missing.length) { r.why = `missing options: ${missing.join(' ')}`; continue; }
         }
-        for (const c of a.checks ?? []) if (!r.why && (await run(c.args, c.nested)).code !== 0) r.why = c.why;
+        for (const c of a.checks ?? []) {
+          if (r.why) break;
+          const x = await run(c.args, c.nested);
+          if (x.why) r.why = boxFailed(c.args.join(' '), x); else if (x.code !== 0) r.why = c.why;
+        }
         r.usable = !r.why;
       } finally {
         rows.set(a.id, r);
       }
     }
-    await rm(join(homes, '.probe'), { recursive: true, force: true });
+    await rmTree(join(homes, '.probe'));
     detected = rows;
     return [...rows.values()];
   }
@@ -239,6 +282,8 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   async function statusIn(userId, a, { signal = stop.signal } = {}) {
     const r = await short(a, cli(a, a.status.args), { home: homeOf(userId, a), net: 'proxy', label: `status=${userId}`, signal });
     if (r.why) throw new Error(r.why);
+    // its silence is no logged-out answer: out of time, or stopped (close(), a canceled login)
+    if (r.timedOut || signal.aborted) throw new Error(r.timedOut ? 'the status check did not finish in time' : 'the status check was stopped');
     return { installed: true, ...a.status.parse(r) };
   }
   let quick = 0;
@@ -256,6 +301,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   async function status(userId, id, { waitMs = 5e3 } = {}) {
     const a = harness(id);
     user(userId);
+    duration(waitMs, 'waitMs', 0);
     if (!detected.get(id)?.usable) return { installed: false, loggedIn: false, method: null, plan: null };
     return quickly(userId, a, waitMs, () => statusIn(userId, a));
   }
@@ -263,6 +309,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   async function logout(userId, id, { waitMs = 5e3 } = {}) {
     const a = usable(id);
     user(userId);
+    duration(waitMs, 'waitMs', 0);
     return quickly(userId, a, waitMs, async () => {
       const r = await short(a, cli(a, a.logout), { home: homeOf(userId, a), net: 'proxy', label: `logout=${userId}` });
       if (r.why) throw new Error(r.why);
@@ -272,12 +319,13 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   /** Remove the user's homes (every harness): a waiting login ends, a running job ends first (its lock). */
   async function purge(userId) {
     user(userId);
-    for (const [k, s] of logins) if (k.startsWith(`${userId}/`)) s.cancel();
-    const releases = [];
+    for (const a of adapters) logins.get(key(userId, a))?.cancel(); // this user's own, never a scope's users
+    // every lock asked for in this tick: a login or job that comes later queues behind the purge in each harness's FIFO
+    const got = await Promise.allSettled(adapters.map((a) => lock(key(userId, a), Infinity, stop.signal)));
     try {
-      for (const a of adapters) releases.push(await lock(key(userId, a), Infinity, stop.signal));
-      await rm(join(homes, userId), { recursive: true, force: true });
-    } finally { releases.forEach((r) => r()); }
+      for (const g of got) if (g.status === 'rejected') throw g.reason;
+      await rmTree(join(homes, userId)); // a folder the user's box made 0555 too
+    } finally { for (const g of got) if (g.status === 'fulfilled') g.value(); }
   }
 
   // ---- login: the CLI's own login in the user's box. paste-code: a URL, then the code the login page shows goes to the CLI's stdin
@@ -285,7 +333,8 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
   // is logged.
   const logins = new Map(); // key -> session
   /**
-   * @returns {{ state: 'starting'|'waiting'|'refused'|'done'|'failed', url: string|null, code: string|null, needsCode: boolean, error?: string,
+   * @returns {{ state: 'starting'|'waiting'|'refused'|'done'|'failed', url: string|null, code: string|null, needsCode: boolean,
+   *   expiresAt: number|null (ms: when the CLI's 10 minutes end, once its box started), error?: string,
    *   waiting: Promise<{url: string, code: string|null, needsCode: boolean}>, done: Promise<{ok: boolean, status?: object, error?: string}>,
    *   submitCode(code: string): boolean, cancel(): void }}
    */
@@ -296,7 +345,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
     let b = null, sent = false, canceled = false, settle;
     const cancel = new AbortController(), signal = AbortSignal.any([stop.signal, cancel.signal]);
     const s = {
-      state: 'starting', url: null, code: null, needsCode: a.login.kind === 'paste-code',
+      state: 'starting', url: null, code: null, needsCode: a.login.kind === 'paste-code', expiresAt: null,
       waiting: new Promise((ok, no) => { settle = { ok, no }; }),
       submitCode(code) {
         if (s.state !== 'waiting' || !s.needsCode || sent || typeof code !== 'string' || !CODE.test(code)) return false;
@@ -338,6 +387,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
         b.child.stdout.on('data', read);
         b.child.stderr.on('data', read);
         const t = setTimeout(() => { timedOut = true; b.kill(); }, LOGIN_MS);
+        s.expiresAt = Date.now() + LOGIN_MS;
         const exit = await b.closed;
         clearTimeout(t);
         if (canceled) return end({ ok: false, error: 'canceled' });
@@ -372,6 +422,7 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
     const a = usable(id), k = key(user(userId), a);
     if (typeof prompt !== 'string' || !prompt || prompt.startsWith('-') || prompt.includes('\0')) throw new Error('prompt must be a non-empty string not starting with "-"');
     if (typeof webSearch !== 'boolean') throw new Error('webSearch must be true or false');
+    duration(timeoutMs, 'timeoutMs');
     if (webSearch && !a.webSearch) throw new Error(`${a.name} has no web search`);
     const canceledResult = () => ({ code: -1, text: '', usage: { input: 0, output: 0, unknown: true }, error: '', stderr: '', why: stop.signal.aborted ? 'runner closed' : null, timedOut: false, canceled: true });
     const activeSignal = signal ? AbortSignal.any([stop.signal, signal]) : stop.signal;
@@ -438,21 +489,25 @@ export async function createRunner({ homes, adapters, bins = {}, pins = {}, bwra
       if (activeSignal.aborted) return canceledResult();
       throw e;
     } finally {
-      if (release) await scrubHome(homeOf(userId, a), a.keep, a.keepJsonKeys).catch(() => report('home scrub failed'));
+      if (release) await scrubHome(homeOf(userId, a), a.keep, a.keepJsonKeys).catch((e) => { if (e.code !== 'ENOENT') report('home scrub failed'); }); // no home yet: nothing to scrub
       free?.();
       release?.();
     }
   }
 
-  /** Any command in the user's box for a harness (a validator over a job's output, say), under the user's lock: { code, out, why }.
-   *  net 'none' by default; 'proxy' gives the harness's hosts. boxDir: where the box sees dir. home: a throwaway home instead of the
-   *  user's (no lock then): for a command someone else chose, which must not see the user's credential. */
+  /** Any command in the user's box for a harness (a validator over a job's output, say), under the user's lock and in a job slot,
+   *  like run(): { code, out, why }. net 'none' by default; 'proxy' gives the harness's hosts. boxDir: where the box sees dir. home: a
+   *  throwaway home instead of the user's (no lock then): for a command someone else chose, which must not see the user's credential.
+   *  Not from inside run()'s callbacks: that run holds a slot, and with maxJobs 1 this one would wait for it forever. */
   async function exec(userId, id, argv, { net = 'none', dir, boxDir, ms = 60e3, stdin, env, roBinds, nested = false, signal, home } = {}) {
     const a = harness(id), k = key(user(userId), a), active = signal ? AbortSignal.any([stop.signal, signal]) : stop.signal;
+    duration(ms, 'ms');
     const release = home ? () => {} : await lock(k, Infinity, active);
+    let free;
     try {
+      free = await jobSlots.acquire(active);
       return await short(a, argv, { home: home ?? homeOf(userId, a), net, dir: dir && await realpath(dir), boxDir, ms, stdin, env, roBinds, nested, signal: active, label: `exec=${userId}` });
-    } finally { release(); }
+    } finally { free?.(); release(); }
   }
 
   /** Stop accepting work, cancel waiters, kill boxes, and wait for in-flight operations to finish their cleanup. Idempotent. */

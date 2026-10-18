@@ -35,7 +35,7 @@ services:
       # AppArmor hosts (Ubuntu): the docker-default profile denies mount; you also need an AppArmor profile that allows it (not shipped)
     cap_drop: [ALL]
     restart: unless-stopped
-    stop_grace_period: 20s # SIGTERM kills every box; runs in progress fail and the app requeues them
+    stop_grace_period: 20s # SIGTERM kills every box; runs in progress end canceled, are forgotten (404 after the restart) and the app requeues them
 
   # a client app: it mounts the socket folder (and nothing of harnessbox's) and keeps its token in its own secrets
   app:
