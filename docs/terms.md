@@ -23,7 +23,7 @@ outside that CLI process (PKCE), but it does pass. Do not log it (harnessbox doe
 
 ## Codex (OpenAI)
 
-Read 2026-10-16 (research for review-automation): no official page was found that covers a third party hosting Codex where each user
+Read 2026-10-16: no official page was found that covers a third party hosting Codex where each user
 signs in with their own ChatGPT plan. What the official docs do say:
 
 - "Don't expose Codex execution in untrusted or public environments";
@@ -32,7 +32,7 @@ signs in with their own ChatGPT plan. What the official docs do say:
 - device-code login must be allowed by the user or their workspace admin in ChatGPT's security settings.
 
 The account-sharing clause of OpenAI's terms could only be seen quoted by third parties (the official page returned 403). Treat
-Codex as needing legal review or OpenAI's confirmation before you open it to other people; review-automation keeps it behind a
+Codex as needing legal review or OpenAI's confirmation before you open it to other people; the app harnessbox was extracted from keeps it behind a
 switch that is off by default.
 
 ## Grok (xAI)
