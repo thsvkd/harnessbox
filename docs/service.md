@@ -183,9 +183,9 @@ client's answer bytes not yet read pass their cap (another of its connections st
 ends without a box. Runs are kept 30 minutes after they end. **A restart forgets every run**: an unknown id is 404,
 and the client starts the run again.
 
-## Example: review-automation's draft job
+## Example: a review-writing app's draft job
 
-What its pool runner (`app/runner/rva-runner.mjs`, `runJob`) prepared and checked, as one `POST /v1/runs`:
+What its former pool runner prepared and checked, as one `POST /v1/runs`:
 
 ```js
 const W = '/work', validator = ['python3', '-I', `${W}/skill/write-review/scripts/validate_draft.py`, `${W}/out/draft.json`];

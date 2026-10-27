@@ -8,7 +8,7 @@ the internet only through a CONNECT proxy that allows the harness's own hosts on
 Use it as a library in your own runner process (below), or run it as a **service** that several web apps call over a unix socket,
 each app with its own token and its own users (`node src/server.mjs`, the image's default command; [docs/service.md](docs/service.md)).
 
-Extracted on 2026-10-16 from review-automation's per-user runner (`app/runner/box.mjs`, `rva-runner.mjs`), deployed there for
+Extracted on 2026-10-16 from the per-user runner of a private review-writing app, deployed there for
 Claude Code and Codex. Node 24.2 or later (`import.meta.main`), Linux (arm64 or x64), bubblewrap, socat; no runtime npm dependencies. Version 0.5.0.
 Install the package tarball from this repository's release, or use a Git dependency. TypeScript declarations and the deployment
 probe are included. The package is not published to the public npm registry.
@@ -113,12 +113,12 @@ What was verified (2026-10-16, this repository's code, Raspberry Pi 5, kernel 6.
   host and plain HTTP, and lets `api.anthropic.com:443` through; a net-none box has no network; every denial is logged with its label.
 - **The same in the runner image under Docker** (`deploy/Dockerfile` built here, run with `deploy/compose.yaml`'s hardening and the
   shipped seccomp profile on Docker 26.1.5): 24/24, with Grok installed by xAI's installer and Codex through its npm wrapper.
-- **Claude Code and Codex in review-automation** (same box design minus the per-harness home and the box seccomp filter) are
+- **Claude Code and Codex in that app** (same box design minus the per-harness home and the box seccomp filter) are
   deployed; their isolation probe passed 24/24 on that host. Real logins and jobs there are that project's own check list, not
   re-run from this repository.
 - **Not verified**: a real login and a real job for Grok (its token exchange, its hosts after login, the logged-in output of
   `grok models`, its streaming-json from a real run — the parser follows `docs/user-guide/14-headless-mode.md` of 1.0.52); the
-  `.claude.json` account-key list against a real `claude auth status` after a scrub (review-automation has it on its real-login list); Grok's own sandbox in a
+  `.claude.json` account-key list against a real `claude auth status` after a scrub (that app has it on its real-login list); Grok's own sandbox in a
   box; the Docker image on x86_64.
 - **Grok on a Raspberry Pi 5**: the official linux-aarch64 build uses SHA-512 instructions the Cortex-A76 lacks and dies with SIGILL
   in its OAuth/crypto path. `--version`, `--help`, `models` and the start of a device login run natively; the token exchange was not
@@ -180,7 +180,7 @@ or when you need hard per-user memory limits. Measured on the same Pi: Firecrack
 
 ## Overhead
 
-Measured 2026-10-16 on a Raspberry Pi 5 (16 GB, kernel 6.18, 16K pages), review-automation's isolation research; this repository's
+Measured 2026-10-16 on a Raspberry Pi 5 (16 GB, kernel 6.18, 16K pages), that app's isolation research; this repository's
 box adds a seccomp filter and `--cap-drop ALL`, which were not benchmarked separately.
 
 | | |
@@ -229,19 +229,11 @@ Before deploying, check on the host: `cat /proc/sys/user/max_user_namespaces` (>
 
 `npm ci && npm run check`: public TypeScript API checks, box primitives (proxy with stubbed DNS and upstream, scrub, reader, counts, argv, seccomp filter in a real box), the
 runner end to end with real bubblewrap boxes and fake CLIs (`test/fake-cli.mjs`), and the service through its client (two clients,
-auth, logins, a review-automation-shaped draft job, cancel, caps, restart, `main()`). Tests that need bubblewrap with user namespaces
+auth, logins, a draft job shaped like a real client's, cancel, caps, restart, `main()`). Tests that need bubblewrap with user namespaces
 skip themselves without it; CI requires working namespaces before running the suite. Regressions cover unreadable disk usage,
 cumulative output limits, UTF-8 fragmentation, async event failures, queued cancellation and shutdown. A separate test installs
 the packed tarball in a fresh project and invokes its shipped probe without a real account. `node deploy/probe.mjs` with the real
 CLIs is the smoke test (`deploy/service-smoke.mjs` for the service); a fake-CLI test is not evidence of an authenticated login or inference.
-
-## How review-automation would use it
-
-Through the service: its server calls `src/client.mjs` for 설정 > AI 연결 (status, login, code, cancel, logout, purge) and for each
-draft job (`POST /v1/runs` with the photos and memo as files, the write-review skill as a read-only folder, `out/` as outputs and
-`validate_draft.py` as the validator), instead of the pool runner polling it. docs/service.md has the request shape. Users' homes
-move from `/homes/<userId>` to `/homes/<client>/<userId>/<engine>` (move `.claude/.credentials.json`, `.claude.json` and
-`.codex/auth.json` once, or log users in again).
 
 ## License
 

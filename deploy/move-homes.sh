@@ -1,9 +1,9 @@
 #!/bin/sh
 # Move per-user homes of the single-scope layout (<old>/<user>/.claude/.credentials.json, .claude.json, .codex/auth.json; what
-# review-automation's runner kept) into the service layout <new>/<client>/<user>/<harness>/. Copies the credential files only,
+# a runner before the service kept) into the service layout <new>/<client>/<user>/<harness>/. Copies the credential files only,
 # regular files only (never a link), and leaves <old> alone. Run it once as the homes' uid with both volumes mounted:
 #   docker run --rm --user 10011:10011 -v runner-homes:/old:ro -v harnessbox-homes:/homes -v "$PWD/deploy:/d:ro" \
-#     --entrypoint sh harnessbox:local /d/move-homes.sh /old /homes rva
+#     --entrypoint sh harnessbox:local /d/move-homes.sh /old /homes myapp
 set -eu
 umask 077
 old=$1 new=$2 client=$3
